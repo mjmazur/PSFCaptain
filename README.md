@@ -40,8 +40,12 @@ python star_measure.py path/to/your_image.fits
 ```
 
 ### With Astrometry Solving
-To get RA/Dec coordinates, use the `--astrometry` flag and provide your Astrometry.net API key:
+To get RA/Dec coordinates, use the `--astrometry` flag. A default API key is provided, but you can override it with your own:
 ```bash
+# Using default API key
+python star_measure.py path/to/your_image.png --astrometry
+
+# Using your own API key
 python star_measure.py path/to/your_image.png --astrometry --api-key YOUR_API_KEY
 ```
 

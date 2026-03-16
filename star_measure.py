@@ -3,6 +3,7 @@ import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder
@@ -50,8 +51,7 @@ def solve_astrometry(file_path, api_key=None):
     elif 'ASTROMETRY_NET_API_KEY' in os.environ:
         ast.api_key = os.environ['ASTROMETRY_NET_API_KEY']
     else:
-        print("Astrometry.net API key not found. Please set ASTROMETRY_NET_API_KEY environment variable.")
-        return None
+        ast.api_key = 'aifriketqrtctpor'
 
     try:
         wcs_header = ast.solve_from_image(file_path)
@@ -67,7 +67,7 @@ def main():
     parser = argparse.ArgumentParser(description="Find and measure stars in an image.")
     parser.add_argument("image", help="Path to FITS or PNG image.")
     parser.add_argument("--astrometry", action="store_true", help="Attempt to solve astrometry via astrometry.net")
-    parser.add_argument("--api-key", help="Astrometry.net API key (optional if env var set)")
+    parser.add_argument("--api-key", help="Astrometry.net API key (default: aifriketqrtctpor)")
     parser.add_argument("--fwhm", type=float, default=3.0, help="Estimated FWHM in pixels (default 3.0)")
     parser.add_argument("--threshold", type=float, default=5.0, help="Source detection threshold in sigma (default 5.0)")
     args = parser.parse_args()
@@ -217,6 +217,46 @@ def main():
         plt.grid(alpha=0.3)
         plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_elong_angle_hist.png'))
     plt.close()
+
+    # Interpolated Maps
+    # Filter for valid measurements
+    valid_mask = (df['fwhm'] != -999) & (df['theta'] != -999)
+    valid_df = df[valid_mask]
+
+    if len(valid_df) >= 4: # Need at least 4 points for cubic interpolation
+        print("Generating interpolated maps...")
+        ny, nx = data.shape
+        grid_x, grid_y = np.mgrid[0:nx:100j, 0:ny:100j] # 100x100 resolution for speed
+        
+        # PSF Size Map
+        grid_fwhm = griddata((valid_df['x'], valid_df['y']), valid_df['fwhm'], 
+                             (grid_x, grid_y), method='linear')
+        
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        plt.colorbar(im, label='FWHM (pixels)')
+        plt.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
+        plt.title(f"Interpolated PSF Size (FWHM) - {os.path.basename(args.image)}")
+        plt.xlabel("X (pixels)")
+        plt.ylabel("Y (pixels)")
+        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_psf_size_map.png'))
+        plt.close()
+
+        # Theta Map
+        grid_theta = griddata((valid_df['x'], valid_df['y']), valid_df['theta'], 
+                              (grid_x, grid_y), method='linear')
+        
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(grid_theta.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        plt.colorbar(im, label='Orientation (degrees)')
+        plt.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
+        plt.title(f"Interpolated PSF Orientation (Theta) - {os.path.basename(args.image)}")
+        plt.xlabel("X (pixels)")
+        plt.ylabel("Y (pixels)")
+        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_theta_map.png'))
+        plt.close()
+    else:
+        print("Insufficient valid stars for interpolation mapping.")
 
     print("Done.")
 
