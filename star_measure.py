@@ -22,7 +22,7 @@ def load_image(file_path):
                 data = data[0]
             header = hdul[0].header
             return data.astype(float), header
-    elif ext == '.png':
+    elif ext in ['.png', '.bmp']:
         img = Image.open(file_path).convert('L')
         data = np.array(img).astype(float)
         header = None
@@ -37,7 +37,7 @@ def load_image(file_path):
     else:
         raise ValueError(f"Unsupported file format: {ext}")
 
-def solve_astrometry(file_path, api_key=None):
+def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=None):
     """Solves astrometry using astrometry.net via astroquery."""
     try:
         from astroquery.astrometry_net import AstrometryNet
@@ -46,6 +46,11 @@ def solve_astrometry(file_path, api_key=None):
         return None
 
     ast = AstrometryNet()
+    # Set a local cache directory to avoid permission issues
+    ast.cache_location = os.path.join(os.getcwd(), '.astrometry_cache')
+    if not os.path.exists(ast.cache_location):
+        os.makedirs(ast.cache_location)
+
     if api_key:
         ast.api_key = api_key
     elif 'ASTROMETRY_NET_API_KEY' in os.environ:
@@ -54,12 +59,54 @@ def solve_astrometry(file_path, api_key=None):
         ast.api_key = 'aifriketqrtctpor'
 
     try:
-        wcs_header = ast.solve_from_image(file_path)
+        from astroquery.exceptions import LoginError, TimeoutError
+    except ImportError:
+        # Fallback for older versions or different import structures
+        class LoginError(Exception): pass
+        class TimeoutError(Exception): pass
+
+    try:
+        if sources is not None and width is not None and height is not None:
+            num_sources = min(len(sources), 100)
+            if num_sources < 10:
+                print(f"Warning: Only {num_sources} stars found. Astrometry may fail without more stars.")
+            
+            print(f"Submitting top {num_sources} sources to Astrometry.net...")
+            sorted_indices = np.argsort(sources['peak'])[::-1]
+            x_sorted = sources['xcentroid'][sorted_indices][:num_sources]
+            y_sorted = sources['ycentroid'][sorted_indices][:num_sources]
+            
+            wcs_header = ast.solve_from_source_list(x_sorted, y_sorted, width, height, 
+                                                   solve_timeout=300,
+                                                   scale_units='arcsecperpix',
+                                                   scale_lower=0.1,
+                                                   scale_upper=100.0)
+        else:
+            print("Submitting full image to Astrometry.net (this may be slower)...")
+            wcs_header = ast.solve_from_image(image_path, solve_timeout=300,
+                                             scale_units='arcsecperpix',
+                                             scale_lower=0.1,
+                                             scale_upper=100.0)
+            
         if wcs_header:
             from astropy.wcs import WCS
             return WCS(wcs_header)
+        else:
+            print("!!! Astrometry failed: The field could not be solved by Astrometry.net.")
+            print("    Possible reasons: fuzzy stars, wrong scale hints, or wrong coordinates.")
+    except LoginError:
+        print("!!! Astrometry failed: Invalid API key. Please check your key at nova.astrometry.net.")
+    except TimeoutError:
+        print("!!! Astrometry failed: The connection to Astrometry.net timed out.")
     except Exception as e:
-        print(f"Astrometry solving failed: {e}")
+        err_str = str(e)
+        print(f"!!! Astrometry failed with error: {err_str}")
+        if "RemoteDisconnected" in err_str or "Max retries exceeded" in err_str:
+            print("    Network Issue: Could not connect to nova.astrometry.net. Please check your internet connection or server status.")
+        elif "api_key" in err_str.lower():
+            print("    API Key Issue: Ensure your API key is valid and has not expired.")
+        else:
+            print("    Hint: Check if the image has enough sharp stars and the field is not too crowded/sparse.")
     
     return None
 
@@ -98,7 +145,8 @@ def main():
     wcs = None
     if args.astrometry:
         print("Attempting to solve astrometry...")
-        wcs = solve_astrometry(args.image, api_key=args.api_key)
+        ny, nx = data.shape
+        wcs = solve_astrometry(args.image, sources=sources, width=nx, height=ny, api_key=args.api_key)
         if wcs:
             print("Astrometry solved successfully.")
         else:
@@ -257,6 +305,44 @@ def main():
         plt.close()
     else:
         print("Insufficient valid stars for interpolation mapping.")
+
+    # Distortion Map (Local Pixel Scale)
+    if wcs:
+        print("Generating distortion map...")
+        ny, nx = data.shape
+        # Create a grid for sampling the WCS
+        gy, gx = np.mgrid[0:ny:20j, 0:nx:20j]
+        scales = np.zeros_like(gx)
+        
+        for i in range(gx.shape[0]):
+            for j in range(gx.shape[1]):
+                # Sample local pixel scale
+                # We move 1 pixel in X and Y to find the local scale
+                x0, y0 = gx[i, j], gy[i, j]
+                sky1 = wcs.pixel_to_world(x0, y0)
+                sky2 = wcs.pixel_to_world(x0 + 1, y0)
+                sky3 = wcs.pixel_to_world(x0, y0 + 1)
+                
+                # Separation is in degrees, convert to arcsec
+                scale_x = sky1.separation(sky2).arcsec
+                scale_y = sky1.separation(sky3).arcsec
+                scales[i, j] = np.sqrt(scale_x * scale_y)
+        
+        # Interpolate sampled scales to a finer grid for plotting
+        grid_x_f, grid_y_f = np.mgrid[0:nx:100j, 0:ny:100j]
+        grid_dist = griddata((gx.flatten(), gy.flatten()), scales.flatten(), 
+                             (grid_x_f, grid_y_f), method='cubic')
+        
+        plt.figure(figsize=(10, 8))
+        im = plt.imshow(grid_dist.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        plt.colorbar(im, label='Local Pixel Scale (arcsec/pixel)')
+        plt.title(f"Field Distortion (Local Pixel Scale) - {os.path.basename(args.image)}")
+        plt.xlabel("X (pixels)")
+        plt.ylabel("Y (pixels)")
+        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_distortion_map.png'))
+        plt.close()
+    else:
+        print("Astrometry not solved; cannot generate distortion map.")
 
     print("Done.")
 

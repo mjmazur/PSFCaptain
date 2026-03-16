@@ -4,7 +4,7 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 
 ## Features
 
-- **Multi-Format Support**: Process `.fits`, `.fit`, and `.png` images.
+- **Multi-Format Support**: Process `.fits`, `.fit`, `.png`, and `.bmp` images.
 - **Robust Star Detection**: Utilizes `photutils.detection.DAOStarFinder` for accurate source identification.
 - **Precision Photometry**: Performs aperture photometry to calculate instrumental magnitudes.
 - **Morphology Analysis**: Measures Point Spread Function (PSF) characteristics including:
@@ -66,6 +66,9 @@ A file named `[image_name]_results.csv` containing:
 Saved in the `Figures/` directory:
 - `[image_name]_mag_hist.png`: Histogram of star brightness.
 - `[image_name]_elong_angle_hist.png`: Distribution of star orientation angles.
+- `[image_name]_psf_size_map.png`: 2D heatmap of FWHM variation.
+- `[image_name]_theta_map.png`: 2D heatmap of PSF orientation.
+- `[image_name]_distortion_map.png`: 2D heatmap of local pixel scale (distortion).
 
 ## Parameters
 - `--fwhm`: Expected FWHM of stars in pixels (default: 3.0).
