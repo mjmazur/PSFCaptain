@@ -6,14 +6,19 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 
 - **Multi-Format Support**: Process `.fits`, `.fit`, `.png`, and `.bmp` images.
 - **Robust Star Detection**: Utilizes `photutils.detection.DAOStarFinder` for accurate source identification.
+- **High-Performance Processing**: Built-in multiprocessing support (`--cores`) for fast analysis on multi-core systems.
 - **Precision Photometry**: Performs aperture photometry to calculate instrumental magnitudes.
-- **Morphology Analysis**: Measures Point Spread Function (PSF) characteristics including:
-  - FWHM (Full Width at Half Maximum)
-  - Elongation
-  - Orientation Angle (Theta)
-- **Automatic Image Inversion**: Features intelligent detection of light-background images (common in inverted PNG exports), automatically inverting them for correct source detection.
-- **Astrometric Integration**: Optional integration with `astrometry.net` via `astroquery` for RA/Dec solving.
-- **Visualization**: Automatically generates histograms for instrumental magnitudes and elongation angles.
+- **Absolute Photometry**: Calibrate your data against international catalogs:
+  - **Gaia G-band**: Best for medium to faint stars.
+  - **Tycho-2 VT-band**: Optimized for bright stars (magnitude 0-9).
+  - **Robust Fitting**: Uses RANSAC algorithm to automatically exclude outliers for high-precision zero-point calibration.
+  - **Smart Tiling**: Automatically handles large fields-of-view (up to 10+ degrees) by dividing queries into manageable tiles.
+- **Morphology Analysis**: Measures Point Spread Function (PSF) characteristics:
+  - FWHM (Full Width at Half Maximum) in pixels and arcseconds.
+  - Elongation and Orientation Angle (Theta).
+- **Automatic Image Inversion**: Intelligent detection and inversion of light-background images.
+- **Astrometric Integration**: Seamless integration with `astrometry.net` for RA/Dec solving.
+- **Comprehensive Visualization**: Generates heatmaps, histograms, and star-field summary overlays.
 
 ## Installation
 
@@ -34,61 +39,56 @@ pip install numpy==1.26.4 pandas matplotlib astropy photutils astroquery pillow
 ## Usage
 
 ### Basic Processing
-Run the script by providing the path to your image:
 ```bash
-python star_measure.py path/to/your_image.fits
+python star_measure.py image.fits --cores 4
 ```
 
-### With Astrometry Solving
-To get RA/Dec coordinates, use the `--astrometry` flag. A default API key is provided, but you can override it with your own:
+### Absolute Photometry (Calibration)
+To calibrate your magnitudes, you must first solve for astrometry. You can choose between Gaia and Tycho-2 catalogs:
 ```bash
-# Using default API key
-python star_measure.py path/to/your_image.png --astrometry
+# Calibrate against Gaia (Default)
+python star_measure.py image.fits --astrometry --absolute
 
-# Using your own API key
-python star_measure.py path/to/your_image.png --astrometry --api-key YOUR_API_KEY
+# Calibrate against Tycho-2 (Recommended for bright stars mag 0-9)
+python star_measure.py image.fits --astrometry --absolute --catalog tycho2
 ```
 
-## Utility Tools
-
-### FITS Binning
-Use `bin_fits.py` to downsample large FITS files. This is useful for speeding up astrometry or reducing noise.
+### Multiprocessing
+Speed up morphology measurements on large files by using multiple CPU cores:
 ```bash
-# Default 2x2 binning (averaging)
-python bin_fits.py path/to/your_image.fits
-
-# Specific 4x4 binning
-python bin_fits.py path/to/your_image.fits --bin 4
-
-# Using summation instead of averaging
-python bin_fits.py path/to/your_image.fits --method sum
+python star_measure.py image.fits --cores 8
 ```
 
 ## Output
 
-The script generates the following outputs:
-
 ### 1. CSV Results
 A file named `[image_name]_results.csv` containing:
 - `x`, `y`: Centered pixel coordinates.
-- `ra`, `dec`: Right Ascension and Declination (if astrometry solved).
+- `ra`, `dec`: Right Ascension and Declination.
 - `mag_instr`: Instrumental magnitude.
-- `fwhm`: Full Width at Half Maximum.
-- `elongation`: Ratio of major to minor axis.
-- `theta`: Orientation angle in degrees.
+- `mag_abs`: Calibrated absolute magnitude (if `--absolute` is used).
+- `fwhm`, `fwhm_arcsec`: PSF size.
+- `elongation`, `theta`: Star shape characteristics.
 
 ### 2. Figures
 Saved in the `Figures/` directory:
-- `[image_name]_mag_hist.png`: Histogram of star brightness.
-- `[image_name]_elong_angle_hist.png`: Distribution of star orientation angles.
-- `[image_name]_psf_size_map.png`: 2D heatmap of FWHM variation.
-- `[image_name]_theta_map.png`: 2D heatmap of PSF orientation.
-- `[image_name]_distortion_map.png`: 2D heatmap of local pixel scale (distortion).
+- `[image_name]_summary.png`: Star field overlay with detection circles and image statistics.
+- `[image_name]_mag_comparison.png`: Diagnostic plot of Catalog vs Instrumental magnitude.
+- `[image_name]_abs_mag_hist.png`: Histogram of calibrated magnitudes.
+- `[image_name]_psf_arcsec_map.png`: 2D heatmap of PSF size in arcseconds.
+- `[image_name]_distortion_map.png`: 2D heatmap of local pixel scale.
 
 ## Parameters
-- `--fwhm`: Expected FWHM of stars in pixels (default: 3.0).
-- `--threshold`: Detection threshold in standard deviations above background (default: 5.0).
-- `--api-key`: Astrometry.net API key (can also be set via `ASTROMETRY_NET_API_KEY` environment variable).
+- `--fwhm`: Expected FWHM in pixels (default: 3.0).
+- `--threshold`: Detection threshold in sigma (default: 5.0).
+- `--cores`: Number of CPU cores to use.
+- `--astrometry`: Solve for RA/Dec via Astrometry.net.
+- `--absolute`: Perform absolute photometry calibration.
+- `--catalog`: Choose `gaia` or `tycho2`.
+- `--api-key`: Astrometry.net API key.
+
+## Performance Note
+The script automatically limits Intel MKL and OpenMP threading to 1 thread per process when using multiprocessing. This prevents "Paging file is too small" errors and memory exhaustion on Windows systems.
 
 ## License
 MIT

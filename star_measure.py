@@ -1,4 +1,11 @@
 import os
+# Set environment variables to limit threading in MKL-dependent libraries
+# This must be done BEFORE importing numpy, scipy, etc. to prevent memory exhaustion in multiprocessing.
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_DOMAIN_NUM_THREADS"] = "1"
+
 import argparse
 import numpy as np
 import pandas as pd
@@ -6,10 +13,83 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.wcs import WCS
+from astropy.coordinates import SkyCoord, match_coordinates_sky
+from astropy import units as u
 from photutils.detection import DAOStarFinder
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
 from photutils.morphology import data_properties
 from PIL import Image
+import concurrent.futures
+import multiprocessing
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+def process_single_star(i, x, y, mag_instr, cutout, std, wcs=None):
+    """Worker function to process a single star's morphology and coordinates."""
+    try:
+        # Get RA/Dec if WCS is available
+        ra, dec = -999.0, -999.0
+        local_scale = None
+        fwhm_arcsec = -999.0
+        
+        if wcs:
+            try:
+                sky_coord = wcs.pixel_to_world(x, y)
+                ra, dec = float(sky_coord.ra.deg), float(sky_coord.dec.deg)
+                
+                # Sample local pixel scale
+                sky1 = sky_coord
+                sky2 = wcs.pixel_to_world(x + 1, y)
+                sky3 = wcs.pixel_to_world(x, y + 1)
+                local_scale = float(np.sqrt(sky1.separation(sky2).arcsec * sky1.separation(sky3).arcsec))
+            except:
+                pass
+
+        # Morphology (FWHM, elongation, theta)
+        # Apply a threshold mask to isolate the star from background noise
+        mask = cutout < (2 * std)
+        props = data_properties(cutout, mask=mask)
+        
+        fwhm = props.fwhm.value if hasattr(props.fwhm, 'value') else props.fwhm
+        elongation = props.elongation.value if hasattr(props.elongation, 'value') else props.elongation
+        theta = props.orientation.deg if hasattr(props.orientation, 'deg') else (
+                props.orientation.value if hasattr(props.orientation, 'value') else props.orientation)
+        
+        fwhm = float(np.array(fwhm))
+        elongation = float(np.array(elongation))
+        theta = float(np.array(theta))
+        
+        if local_scale is not None:
+            fwhm_arcsec = fwhm * local_scale
+            
+        return {
+            'index': i,
+            'x': float(x),
+            'y': float(y),
+            'ra': ra,
+            'dec': dec,
+            'mag_instr': float(mag_instr),
+            'fwhm': fwhm,
+            'fwhm_arcsec': float(fwhm_arcsec),
+            'elongation': elongation,
+            'theta': theta,
+            'local_scale': local_scale
+        }
+    except Exception as e:
+        return {
+            'index': i,
+            'x': float(x),
+            'y': float(y),
+            'ra': -999.0,
+            'dec': -999.0,
+            'mag_instr': float(mag_instr),
+            'fwhm': -999.0,
+            'fwhm_arcsec': -999.0,
+            'elongation': -999.0,
+            'theta': -999.0,
+            'local_scale': None
+        }
+
 
 def load_image(file_path):
     """Loads FITS or PNG image and returns data as a 2D numpy array."""
@@ -110,21 +190,73 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
     
     return None
 
-def main():
-    parser = argparse.ArgumentParser(description="Find and measure stars in an image.")
-    parser.add_argument("image", help="Path to FITS or PNG image.")
-    parser.add_argument("--astrometry", action="store_true", help="Attempt to solve astrometry via astrometry.net")
-    parser.add_argument("--api-key", help="Astrometry.net API key (default: aifriketqrtctpor)")
-    parser.add_argument("--fwhm", type=float, default=3.0, help="Estimated FWHM in pixels (default 3.0)")
-    parser.add_argument("--threshold", type=float, default=5.0, help="Source detection threshold in sigma (default 5.0)")
-    args = parser.parse_args()
+def query_catalog_tiled(center_sky, radius_deg, catalog_name="gaia", tile_size_deg=2.0):
+    """
+    Queries a catalog using a tiled approach to cover large fields without server timeouts.
+    """
+    from astropy.table import vstack, unique
+    
+    # Calculate the number of tiles needed
+    # We use a grid that covers a square of 2*radius x 2*radius
+    num_tiles_side = int(np.ceil((2 * radius_deg) / tile_size_deg))
+    if num_tiles_side <= 1:
+        # Single query is enough
+        return _perform_single_query(center_sky, radius_deg, catalog_name)
+    
+    print(f"Field is large ({radius_deg:.2f} deg radius). Dividing into {num_tiles_side}x{num_tiles_side} tiles...")
+    
+    all_results = []
+    # Grid spacing (with 10% overlap)
+    spacing = tile_size_deg * 0.9
+    
+    # Start from center - radius and go to center + radius
+    # Note: This is an approximation for RA/Dec but sufficient for tiling a small-ish region of the sky
+    # For very large regions or near poles, this would need more care.
+    ra_start = center_sky.ra.deg - radius_deg
+    dec_start = center_sky.dec.deg - radius_deg
+    
+    for i in range(num_tiles_side):
+        for j in range(num_tiles_side):
+            # Calculate tile center
+            tile_ra = ra_start + (i + 0.5) * spacing
+            tile_dec = dec_start + (j + 0.5) * spacing
+            
+            # Wrap RA
+            tile_ra = tile_ra % 360.0
+            # Clip Dec
+            tile_dec = np.clip(tile_dec, -90.0, 90.0)
+            
+            tile_center = SkyCoord(ra=tile_ra, dec=tile_dec, unit=(u.deg, u.deg))
+            # Search radius for each tile covers the tile area
+            tile_radius = (tile_size_deg / np.sqrt(2)) * 1.1 # slightly larger to ensure coverage
+            
+            res = _perform_single_query(tile_center, tile_radius, catalog_name)
+            if res is not None and len(res) > 0:
+                all_results.append(res)
+    
+    if not all_results:
+        return None
+    
+    combined = vstack(all_results)
+    # Remove duplicates based on coordinates (rounded to avoid precision issues)
+    # Different catalogs have different ID columns, so coordinates are a safe bet.
+    combined['tmp_ra_round'] = np.round(combined['ra'] if 'ra' in combined.colnames else combined['RA(ICRS)'], 6)
+    combined['tmp_dec_round'] = np.round(combined['dec'] if 'dec' in combined.colnames else combined['DE(ICRS)'], 6)
+    
+    final_table = unique(combined, keys=['tmp_ra_round', 'tmp_dec_round'])
+    final_table.remove_columns(['tmp_ra_round', 'tmp_dec_round'])
+    
+    return final_table
 
-    # Create Figures directory
-    if not os.path.exists('Figures'):
-        os.makedirs('Figures')
-
-    print(f"Processing image: {args.image}")
-    data, header = load_image(args.image)
+def process_image(image_path, args, figures_dir, csvs_dir):
+    """Processes a single image file."""
+    print(f"\n--- Processing: {os.path.basename(image_path)} ---")
+    try:
+        data, header = load_image(image_path)
+        ny, nx = data.shape
+    except Exception as e:
+        print(f"Error loading {image_path}: {e}")
+        return
 
     # Basic stats for background subtraction
     mean, median, std = sigma_clipped_stats(data, sigma=3.0)
@@ -141,249 +273,283 @@ def main():
 
     print(f"Found {len(sources)} stars.")
 
-    # Astrometry
+    # Solve Astrometry
     wcs = None
     if args.astrometry:
         print("Attempting to solve astrometry...")
-        ny, nx = data.shape
-        wcs = solve_astrometry(args.image, sources=sources, width=nx, height=ny, api_key=args.api_key)
-        if wcs:
-            print("Astrometry solved successfully.")
-        else:
-            print("Astrometry matching failed or skipped.")
+        wcs = solve_astrometry(image_path, sources, api_key=args.api_key)
+        if not wcs:
+            print("!!! Astrometry failed. Some features will be limited.")
 
-    # Measurements
-    results = []
-    all_local_scales = []  # To collect plate scale measurements from each star
-    positions = np.transpose((sources['xcentroid'], sources['ycentroid']))
-    apertures = CircularAperture(positions, r=args.fwhm * 1.5)
-    annulus_aperture = CircularAnnulus(positions, r_in=args.fwhm * 2, r_out=args.fwhm * 3)
-    
-    # Photometry
-    print("Performing photometry...")
-    phot_table = aperture_photometry(data_sub, apertures)
-    
-    # Background estimation for photometry (simple local background subtraction already done globally but refined here)
-    # Ensure flux is a plain array for log calculation
-    flux = phot_table['aperture_sum']
-    if hasattr(flux, 'value'):
-        flux = flux.value
-    
-    # mag = -2.5 * log10(flux)
-    mag_instr = -2.5 * np.log10(np.maximum(flux, 1e-6))
-    phot_table['mag_instr'] = mag_instr
+    # Convert sources to pandas for easier handling
+    df = sources.to_pandas()
+    df['mag_instr'] = -2.5 * np.log10(df['flux'])
+    df['mag_abs'] = np.nan
+    df['fwhm_arc'] = np.nan
 
-    # Morphology (FWHM, Elongation, Angle)
-    print("Measuring morphology...")
-    for i, row in enumerate(sources):
+    # Initial clip: Only stars with positive flux (mag < 0)
+    count_before = len(df)
+    df = df[df['mag_instr'] < 0].copy()
+    num_clipped = count_before - len(df)
+    if num_clipped > 0:
+        print(f"Clipped {num_clipped} stars with non-positive flux. {len(df)} stars remaining.")
+
+    # PSF Morphometry (Multiprocessing)
+    print(f"Measuring morphology using {args.cores} cores...")
+    star_tasks = []
+    for i, (idx, row) in enumerate(df.iterrows()):
         x, y = row['xcentroid'], row['ycentroid']
-        
-        # Get RA/Dec if WCS is available
-        ra, dec = -999, -999
-        if wcs:
-            try:
-                sky_coord = wcs.pixel_to_world(x, y)
-                if hasattr(sky_coord.ra, 'deg'):
-                    ra, dec = sky_coord.ra.deg, sky_coord.dec.deg
-                else:
-                    ra, dec = sky_coord.ra, sky_coord.dec
-            except:
-                pass
-
-        # Estimate local morphology (FWHM, elongation, theta)
-        # Use a more targeted cutout size (3x the initial FWHM estimate)
-        size = int(args.fwhm * 3)
+        size = int(args.fwhm * 5)
         x_min, x_max = max(0, int(x - size)), min(data.shape[1], int(x + size))
         y_min, y_max = max(0, int(y - size)), min(data.shape[0], int(y + size))
         cutout = data_sub[y_min:y_max, x_min:x_max]
-        
-        try:
-            # Apply a threshold mask to isolate the star from background noise
-            # This is critical for moment-based measurements in noisy/compressed images
-            mask = cutout < (2 * std) # Slightly lower threshold for cutout isolation
-            props = data_properties(cutout, mask=mask)
-            
-            # Use getattr to safely get values from Quantities and handle failures
-            fwhm = props.fwhm.value if hasattr(props.fwhm, 'value') else props.fwhm
-            elongation = props.elongation.value if hasattr(props.elongation, 'value') else props.elongation
-            theta = props.orientation.deg if hasattr(props.orientation, 'deg') else (
-                    props.orientation.value if hasattr(props.orientation, 'value') else props.orientation)
-            
-            # Final conversion to float
-            fwhm = float(np.array(fwhm))
-            elongation = float(np.array(elongation))
-            theta = float(np.array(theta))
-            
-            # If photometry failed or FWHM is invalid, mark it
-            if phot_table['mag_instr'][i] > 14.99 or np.isnan(fwhm):
-                fwhm, elongation, theta = -999.0, -999.0, -999.0
-            
-            # Calculate fwhm_arcsec if wcs is available
-            fwhm_arcsec = -999.0
-            if wcs and fwhm != -999:
-                try:
-                    # Local pixel scale at (x, y)
-                    sky1 = wcs.pixel_to_world(x, y)
-                    sky2 = wcs.pixel_to_world(x + 1, y)
-                    sky3 = wcs.pixel_to_world(x, y + 1)
-                    scale_x = sky1.separation(sky2).arcsec
-                    scale_y = sky1.separation(sky3).arcsec
-                    local_scale = np.sqrt(scale_x * scale_y)
-                    fwhm_arcsec = fwhm * local_scale
-                    all_local_scales.append(local_scale)
-                except:
-                    pass
-            
-        except Exception as e:
-            if i < 5: # Only print for first 5 stars to avoid spam
-                print(f"Morphology failed for star at ({x:.1f}, {y:.1f}): {e}")
-            fwhm, elongation, theta = -999, -999, -999
-            fwhm_arcsec = -999.0
+        star_tasks.append((i, x, y, row['mag_instr'], cutout, std, wcs))
 
-        results.append({
-            'x': float(x),
-            'y': float(y),
-            'ra': float(ra),
-            'dec': float(dec),
-            'mag_instr': float(mag_instr[i]),
-            'fwhm': float(fwhm),
-            'fwhm_arcsec': float(fwhm_arcsec),
-            'elongation': float(elongation),
-            'theta': float(theta)
-        })
+    results = [None] * len(df)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=args.cores) as executor:
+        futures = [executor.submit(process_single_star, *task) for task in star_tasks]
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            results[res['index']] = res
+    
+    # Merge results
+    for i, res in enumerate(results):
+        if res is not None:
+            for key in res:
+                if key != 'index': # index is internal
+                    df.loc[df.index[i], key] = res[key]
 
-    # Save to CSV
-    df = pd.DataFrame(results)
-    csv_name = f"{args.image}_results.csv"
-    try:
-        df.to_csv(csv_name, index=False)
-        print(f"Results saved to {csv_name}")
-    except PermissionError:
-        print(f"!!! Error: Could not save CSV to {csv_name}. Please ensure the file is not open in another program.")
-    except Exception as e:
-        print(f"!!! Error saving CSV: {e}")
+    # Absolute Photometry
+    zero_point = None
+    if args.absolute:
+        if not wcs:
+            print("!!! Absolute photometry skipped: Astrometry must be solved first. Use --astrometry.")
+        else:
+            from astropy.coordinates import SkyCoord
+            center_sky = wcs.pixel_to_world(df['xcentroid'].mean(), df['ycentroid'].mean())
+            # Estimate radius needed to cover the image
+            p0 = wcs.pixel_to_world(0, 0)
+            p1 = wcs.pixel_to_world(nx, ny)
+            radius = p0.separation(p1).deg / 2.0 * 1.2
+            
+            print(f"Performing absolute photometry via {args.catalog.upper()} catalog...")
+            catalog_results = query_catalog_tiled(center_sky, radius, args.catalog)
+            
+            if catalog_results is not None and len(catalog_results) > 0:
+                cat_ra = catalog_results['ra'] if 'ra' in catalog_results.colnames else catalog_results['RA(ICRS)']
+                cat_dec = catalog_results['dec'] if 'dec' in catalog_results.colnames else catalog_results['DE(ICRS)']
+                
+                # Magnitude column depends on catalog
+                if args.catalog == 'gaia':
+                    cat_mag = catalog_results['phot_g_mean_mag']
+                    mag_label = "Gaia G"
+                else: # tycho2
+                    cat_mag = catalog_results['VTmag']
+                    mag_label = "Tycho-2 VT"
 
-    # Plotting
+                catalog_coords = SkyCoord(ra=cat_ra*u.deg, dec=cat_dec*u.deg)
+                star_coords = wcs.pixel_to_world(df['xcentroid'], df['ycentroid'])
+                
+                # Match
+                # We use a 5 pixel match limit. Calculate that in arcsec based on image scale
+                scale_guess = wcs.pixel_to_world(0,0).separation(wcs.pixel_to_world(1,0)).arcsec
+                match_limit_arcsec = 5 * scale_guess
+                print(f"Matching stars with a limit of 5 pixels ({match_limit_arcsec:.2f} arcsec)...")
+                
+                idx, d2d, _ = star_coords.match_to_catalog_sky(catalog_coords)
+                matches_mask = d2d < match_limit_arcsec * u.arcsec
+                
+                if matches_mask.any():
+                    matched_df = df[matches_mask].copy()
+                    matched_cat_mag = cat_mag[idx[matches_mask]]
+                    
+                    # Selective RANSAC Fitting: Use stars with mag_instr < -7 
+                    # (Restoring all stars for the plot/CSV, but only using bright ones for the fit)
+                    fit_mask = matched_df['mag_instr'] < -7
+                    
+                    if fit_mask.sum() > 5:
+                        print(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < -7...")
+                        x_fit = matched_df[fit_mask]['mag_instr'].values.reshape(-1, 1)
+                        y_fit = matched_cat_mag[fit_mask].values
+                    else:
+                        if fit_mask.sum() > 0:
+                            print(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < -7. Using all {len(matched_df)} matched stars for fit.")
+                        x_fit = matched_df['mag_instr'].values.reshape(-1, 1)
+                        y_fit = matched_cat_mag.values
+
+                    from sklearn.linear_model import RANSACRegressor
+                    ransac = RANSACRegressor()
+                    ransac.fit(x_fit, y_fit)
+                    inlier_mask = ransac.inlier_mask_
+                    
+                    # The offset (zero point) is the intercept if we assume slope=1
+                    # Actually, we want phot_cat = mag_instr + ZP, so ZP = phot_cat - mag_instr
+                    # RANSAC fits y = slope*x + intercept. Here y is cat_mag, x is mag_instr.
+                    # We expect slope close to 1.
+                    zero_point = np.median(y_fit[inlier_mask] - x_fit[inlier_mask].flatten())
+                    print(f"RANSAC Zero-Point ({mag_label}): {zero_point:.3f} mag (based on {inlier_mask.sum()} inliers)")
+                    
+                    df['mag_abs'] = df['mag_instr'] + zero_point
+                    
+                    # Magnitude Comparison Plot
+                    plt.figure(figsize=(10, 6))
+                    # Plot everything first as context
+                    plt.scatter(matched_df['mag_instr'], matched_cat_mag, c='orange', s=10, alpha=0.5, label='Other Matched Stars')
+                    
+                    # Highlight the RANSAC set
+                    if fit_mask.any():
+                        x_fit_all = matched_df[fit_mask]['mag_instr']
+                        y_fit_all = matched_cat_mag[fit_mask]
+                        plt.scatter(x_fit_all[inlier_mask], y_fit_all[inlier_mask], c='blue', s=30, label='RANSAC Inliers (< -7)')
+                        plt.scatter(x_fit_all[~inlier_mask], y_fit_all[~inlier_mask], c='gray', marker='x', s=30, label='RANSAC Outliers')
+                    
+                    # Plot the theoretical fit line (slope=1)
+                    x_range = np.linspace(df['mag_instr'].min(), df['mag_instr'].max(), 100)
+                    plt.plot(x_range, x_range + zero_point, 'r--', alpha=0.8, label=f'Fit (ZP={zero_point:.2f})')
+                    
+                    plt.xlabel("Instrumental Magnitude")
+                    plt.ylabel(f"Catalog Magnitude ({mag_label})")
+                    plt.title(f"Absolute Photometry Calibration - {os.path.basename(image_path)}")
+                    plt.legend()
+                    plt.grid(True, alpha=0.3)
+                    
+                    # Add stats text
+                    stats_text = f"Matched: {len(matched_df)}\nInliers: {inlier_mask.sum()}\nZP: {zero_point:.3f}"
+                    plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
+                             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                    
+                    mag_plot_name = os.path.join(figures_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
+                    plt.savefig(mag_plot_name, bbox_inches='tight')
+                    plt.close()
+                else:
+                    print(f"No Gaia stars matched within {match_limit_arcsec:.2f} arcseconds.")
+            else:
+                print(f"{args.catalog.upper()} query returned no sources in this field.")
+
+    # Save Results
+    results_csv = os.path.join(csvs_dir, f'{os.path.basename(image_path)}_results.csv')
+    df.to_csv(results_csv, index=False)
+    print(f"Results saved to {results_csv}")
+
+    # Visualizations
     print("Generating figures...")
     
-    # Histogram of instrumental magnitudes
-    plt.figure(figsize=(8, 6))
-    mag_data = df['mag_instr'].values
-    mag_data = mag_data[np.isfinite(mag_data)]
-    if len(mag_data) > 0:
-        plt.hist(mag_data, bins=30, color='skyblue', edgecolor='black')
-        plt.title(f"Instrumental Magnitudes - {os.path.basename(args.image)}")
-        plt.xlabel("Instrumental Magnitude")
-        plt.ylabel("Frequency")
-        plt.grid(alpha=0.3)
-        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_mag_hist.png'))
-    plt.close()
-
-    # Histogram of direction of elongation
-    plt.figure(figsize=(8, 6))
-    theta_data = df[df['theta'] != -999]['theta'].values
-    theta_data = theta_data[np.isfinite(theta_data)]
-    if len(theta_data) > 0:
-        plt.hist(theta_data, bins=30, color='salmon', edgecolor='black')
-        plt.title(f"Direction of Elongation - {os.path.basename(args.image)}")
-        plt.xlabel("Orientation (degrees)")
-        plt.ylabel("Frequency")
-        plt.grid(alpha=0.3)
-        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_elong_angle_hist.png'))
+    # Simple star field plot
+    plt.figure(figsize=(10, 8))
+    plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 99))
+    plt.scatter(df['xcentroid'], df['ycentroid'], s=20, edgecolor='red', facecolor='none', alpha=0.5)
+    plt.title(f"Detected Stars - {os.path.basename(image_path)}")
+    plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_detected.png'), bbox_inches='tight')
     plt.close()
 
     # Interpolated Maps
-    # Filter for valid measurements
-    valid_mask = (df['fwhm'] != -999) & (df['theta'] != -999)
-    valid_df = df[valid_mask]
-
-    if len(valid_df) >= 4: # Need at least 4 points for cubic interpolation
+    if len(df) > 10:
         print("Generating interpolated maps...")
-        ny, nx = data.shape
-        grid_x, grid_y = np.mgrid[0:nx:100j, 0:ny:100j] # 100x100 resolution for speed
+        from scipy.interpolate import griddata
+        grid_x, grid_y = np.mgrid[0:nx:100j, 0:ny:100j]
         
-        # PSF Size Map
-        grid_fwhm = griddata((valid_df['x'], valid_df['y']), valid_df['fwhm'], 
-                             (grid_x, grid_y), method='linear')
-        
+        # FWHM Map
         plt.figure(figsize=(10, 8))
+        grid_fwhm = griddata((df['xcentroid'], df['ycentroid']), df['fwhm'], (grid_x, grid_y), method='cubic')
         ax = plt.gca()
         im = ax.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='FWHM (pixels)')
-        ax.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
-        ax.set_title(f"Interpolated PSF Size (FWHM) - {os.path.basename(args.image)}")
-        ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
-        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_psf_size_map.png'))
+        ax.set_title(f"FWHM Map - {os.path.basename(image_path)}")
+        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_fwhm_map.png'), bbox_inches='tight')
         plt.close()
 
-        # PSF Arcsec Map
-        valid_arcsec_df = valid_df[valid_df['fwhm_arcsec'] != -999.0]
-        if len(valid_arcsec_df) >= 4:
+        # PSF Arcsec Map (if WCS available)
+        if wcs:
             print("Generating PSF arcsec map...")
-            grid_fwhm_arc = griddata((valid_arcsec_df['x'], valid_arcsec_df['y']), valid_arcsec_df['fwhm_arcsec'], 
-                                     (grid_x, grid_y), method='linear')
+            avg_fwhm_px = df['fwhm'].mean()
+            # Calculate local pixel scale at each star
+            all_local_scales = []
+            for _, row in df.iterrows():
+                x, y = row['xcentroid'], row['ycentroid']
+                s1 = wcs.pixel_to_world(x, y)
+                s2 = wcs.pixel_to_world(x + 1, y)
+                s3 = wcs.pixel_to_world(x, y + 1)
+                local_scale = np.sqrt(s1.separation(s2).arcsec * s1.separation(s3).arcsec)
+                all_local_scales.append(local_scale)
+            
+            df['fwhm_arc'] = df['fwhm'] * np.array(all_local_scales)
             
             plt.figure(figsize=(10, 8))
+            grid_fwhm_arc = griddata((df['xcentroid'], df['ycentroid']), df['fwhm_arc'], (grid_x, grid_y), method='cubic')
             ax = plt.gca()
             im = ax.imshow(grid_fwhm_arc.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-            from mpl_toolkits.axes_grid1 import make_axes_locatable
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.1)
-            plt.colorbar(im, cax=cax, label='FWHM (arcseconds)')
-            ax.scatter(valid_arcsec_df['x'], valid_arcsec_df['y'], c='red', s=5, alpha=0.3)
-            ax.set_title(f"Interpolated PSF Size (Arcseconds) - {os.path.basename(args.image)}")
-            ax.set_xlabel("X (pixels)")
-            ax.set_ylabel("Y (pixels)")
-            plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_psf_arcsec_map.png'))
+            plt.colorbar(im, cax=cax, label='FWHM (arcsec)')
+            ax.set_title(f"PSF Size Map (arcsec) - {os.path.basename(image_path)}")
+            plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_psf_arcsec_map.png'), bbox_inches='tight')
             plt.close()
 
         # Theta Map
-        grid_theta = griddata((valid_df['x'], valid_df['y']), valid_df['theta'], 
-                              (grid_x, grid_y), method='linear')
-        
         plt.figure(figsize=(10, 8))
+        grid_theta = griddata((df['xcentroid'], df['ycentroid']), df['theta'], (grid_x, grid_y), method='cubic')
         ax = plt.gca()
         im = ax.imshow(grid_theta.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.1)
-        plt.colorbar(im, cax=cax, label='Orientation (degrees)')
-        ax.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
-        ax.set_title(f"Interpolated PSF Orientation (Theta) - {os.path.basename(args.image)}")
-        ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
-        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_theta_map.png'))
+        plt.colorbar(im, cax=cax, label='Theta (degrees)')
+        ax.set_title(f"PSF Orientation Map - {os.path.basename(image_path)}")
+        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_theta_map.png'), bbox_inches='tight')
         plt.close()
-    else:
-        print("Insufficient valid stars for interpolation mapping.")
 
-    # Distortion Map (Local Pixel Scale)
     if wcs:
         print("Generating distortion map...")
-        ny, nx = data.shape
-        # Create a grid for sampling the WCS
+        # Create a grid of points for WCS sampling
         gy, gx = np.mgrid[0:ny:20j, 0:nx:20j]
         scales = np.zeros_like(gx)
         
+        # Calculate reference scale at the image center (zero distortion reference)
+        cx, cy = nx / 2, ny / 2
+        s1_c = wcs.pixel_to_world(cx, cy)
+        s2_c = wcs.pixel_to_world(cx + 1, cy)
+        s3_c = wcs.pixel_to_world(cx, cy + 1)
+        center_scale_x = s1_c.separation(s2_c).arcsec
+        center_scale_y = s1_c.separation(s3_c).arcsec
+        center_scale_avg = np.sqrt(center_scale_x * center_scale_y)
+        
+        print(f"Calculating local distortion vectors (ref: {center_scale_avg:.3f}\"/pix at center)...")
         for i in range(gx.shape[0]):
             for j in range(gx.shape[1]):
-                # Sample local pixel scale
-                # We move 1 pixel in X and Y to find the local scale
                 x0, y0 = gx[i, j], gy[i, j]
                 sky1 = wcs.pixel_to_world(x0, y0)
                 sky2 = wcs.pixel_to_world(x0 + 1, y0)
                 sky3 = wcs.pixel_to_world(x0, y0 + 1)
-                
-                # Separation is in degrees, convert to arcsec
                 scale_x = sky1.separation(sky2).arcsec
                 scale_y = sky1.separation(sky3).arcsec
                 scales[i, j] = np.sqrt(scale_x * scale_y)
         
-        # Interpolate sampled scales to a finer grid for plotting
+        # Calculate the gradient of the scale field
+        grad_y, grad_x = np.gradient(scales)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+        grad_mag = np.where(grad_mag == 0, 1e-10, grad_mag)
+        dir_x = -grad_x / grad_mag
+        dir_y = -grad_y / grad_mag
+        dist_mag = np.abs(scales - center_scale_avg)
+        u_raw = dist_mag * dir_x
+        v_raw = dist_mag * dir_y
+        
+        raw_mag = np.sqrt(u_raw**2 + v_raw**2)
+        max_raw = np.max(raw_mag)
+        
+        if max_raw > 0:
+            u_comp = (u_raw / max_raw) * 75
+            v_comp = (v_raw / max_raw) * 75
+            key_length_px = 50
+            key_length_arcsec = (50.0 / 75.0) * max_raw
+        else:
+            u_comp = u_raw
+            v_comp = v_raw
+            key_length_arcsec = 0.0
+            key_length_px = 50 
+        
+        # Interpolate heatmap
         grid_x_f, grid_y_f = np.mgrid[0:nx:100j, 0:ny:100j]
         grid_dist = griddata((gx.flatten(), gy.flatten()), scales.flatten(), 
                              (grid_x_f, grid_y_f), method='cubic')
@@ -391,96 +557,137 @@ def main():
         plt.figure(figsize=(10, 8))
         ax = plt.gca()
         im = ax.imshow(grid_dist.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        q = ax.quiver(gx, gy, u_comp, v_comp, color='white', alpha=0.8, 
+                      scale_units='xy', angles='xy', scale=1.0,
+                      headwidth=2.25, headlength=3.75, headaxislength=3.375)
+        ax.quiverkey(q, 0.9, 1.05, 50, f'{key_length_arcsec:.3f}"/pix relative to center', 
+                     labelpos='E', coordinates='axes', color='black')
+        
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='Local Pixel Scale (arcsec/pixel)')
-        ax.set_title(f"Field Distortion (Local Pixel Scale) - {os.path.basename(args.image)}")
-        ax.set_xlabel("X (pixels)")
-        ax.set_ylabel("Y (pixels)")
-        plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_distortion_map.png'))
+        ax.set_title(f"Astrometric Distortion Map - {os.path.basename(image_path)}")
+        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_distortion_map.png'), bbox_inches='tight')
         plt.close()
-    else:
-        print("Astrometry not solved; cannot generate distortion map.")
 
-    # Summary Overlay Figure
+    # Summary Figure
     print("Generating summary overlay figure...")
     plt.figure(figsize=(12, 10))
-    # Use log scaling for background if visibility is an issue
-    bg_data = data_sub + median
-    # Clip and normalize for display
-    vmin, vmax = np.percentile(bg_data, [1, 99.5])
-    plt.imshow(bg_data, origin='lower', cmap='gray', vmin=vmin, vmax=vmax, interpolation='nearest')
+    plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 99))
     
-    # Overlay stars
-    from matplotlib.patches import Circle
-    valid_df = df[df['fwhm'] != -999]
-    for _, row in valid_df.iterrows():
-        # Radius = 2 * FWHM leads to Diameter = 4x FWHM
-        circle = Circle((row['x'], row['y']), radius=row['fwhm'] * 2.0, color='red', fill=False, linewidth=1, alpha=0.6)
-        plt.gca().add_patch(circle)
-    
-    # Information Box
-    fwhm_px = valid_df['fwhm'].values
-    fwhm_arc = valid_df[valid_df['fwhm_arcsec'] != -999.0]['fwhm_arcsec'].values
-    
-    def fmt_stats(px_list, arc_list, func):
-        if len(px_list) == 0: return "N/A"
-        px = func(px_list)
-        if len(arc_list) > 0:
-            arc = func(arc_list)
-            return f"{px:.2f} ({arc:.2f}\")"
-        return f"{px:.2f}"
+    # Draw circles around stars: radius = 2 * FWHM_pixels
+    for _, row in df.iterrows():
+        circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
+                          color='red', fill=False, linewidth=0.8, alpha=0.6)
+        plt.gca().add_patch(circ)
 
-    # Calculate average scale if WCS is available
+    # Info box
+    fwhm_px = df['fwhm'].values
+    fwhm_arc = df['fwhm_arc'].values
+    def fmt_stats(px, arc, func):
+        v_px = func(px)
+        v_arc = func(arc)
+        if np.isnan(v_arc):
+            return f"{v_px:.2f} px (N/A)"
+        return f"{v_px:.2f} px ({v_arc:.2f}\")"
+
     if wcs:
-        # Prioritize the collection of individual star scales for the most accurate average
-        if 'all_local_scales' in locals() and len(all_local_scales) > 0:
+        if 'all_local_scales' in locals():
             avg_scale = np.mean(all_local_scales)
         elif 'scales' in locals():
             avg_scale = np.mean(scales)
         else:
             try:
-                ny, nx = data.shape
-                sky1 = wcs.pixel_to_world(nx/2, ny/2)
-                sky2 = wcs.pixel_to_world(nx/2 + 1, ny/2)
-                sky3 = wcs.pixel_to_world(nx/2, ny/2 + 1)
-                avg_scale = np.sqrt(sky1.separation(sky2).arcsec * sky1.separation(sky3).arcsec)
-            except:
-                avg_scale = -999.0
-    else:
-        avg_scale = -999.0
+                sky1_ref = wcs.pixel_to_world(nx/2, ny/2)
+                sky2_ref = wcs.pixel_to_world(nx/2 + 1, ny/2)
+                sky3_ref = wcs.pixel_to_world(nx/2, ny/2 + 1)
+                avg_scale = np.sqrt(sky1_ref.separation(sky2_ref).arcsec * sky1_ref.separation(sky3_ref).arcsec)
+            except: avg_scale = -999.0
+    else: avg_scale = -999.0
 
-    scale_str = f"{avg_scale:.3f} \"/pix" if avg_scale != -999.0 else "N/A"
-    
     info_text = (
-        f"Image: {os.path.basename(args.image)}\n"
+        f"Image: {os.path.basename(image_path)}\n"
         f"Size: {nx} x {ny} px\n"
-        f"Scale: {scale_str}\n\n"
-        f"FWHM: pixels (arcseconds)\n"
+        f"Scale: {avg_scale:.3f}\"/pix\n"
+        f"Zero Point: {zero_point if zero_point else 'N/A'}\n\n"
+        f"FWHM:\n"
         f"  Min: {fmt_stats(fwhm_px, fwhm_arc, np.min)}\n"
         f"  Max: {fmt_stats(fwhm_px, fwhm_arc, np.max)}\n"
         f"  Avg: {fmt_stats(fwhm_px, fwhm_arc, np.mean)}\n"
-        f"  Std: {fmt_stats(fwhm_px, fwhm_arc, np.std)}\n\n"
-        f"Background:\n"
-        f"  Mean: {median:.2f}\n"
-        f"  Std: {std:.2f}"
     )
+    plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=10, fontfamily='monospace')
     
-    # Add box to plot
-    plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, 
-             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-             fontsize=10, fontfamily='monospace')
-    
-    plt.title(f"Star Detection Summary - {os.path.basename(args.image)}")
-    plt.xlabel("X (pixels)")
-    plt.ylabel("Y (pixels)")
-    summary_name = os.path.join('Figures', f'{os.path.basename(args.image)}_summary.png')
-    plt.savefig(summary_name, dpi=150)
+    plt.title(f"Star Detection Summary - {os.path.basename(image_path)}")
+    plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_summary.png'), dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Summary figure saved to {summary_name}")
 
-    print("Done.")
+def _perform_single_query(center_sky, radius_deg, catalog_name):
+    """Helper for a single catalog query."""
+    try:
+        if catalog_name == "gaia":
+            from astroquery.gaia import Gaia
+            job = Gaia.cone_search_async(center_sky, radius=radius_deg * u.deg)
+            return job.get_results()
+        elif catalog_name == "tycho2":
+            from astroquery.vizier import Vizier
+            v = Vizier(catalog=['I/259/tyc2'])
+            v.ROW_LIMIT = -1
+            viz_results = v.query_region(center_sky, radius=radius_deg * u.deg)
+            if viz_results:
+                return viz_results[0]
+    except Exception as e:
+        print(f"  Query at {center_sky.to_string('hmsdms')} failed: {e}")
+    return None
+
+def main():
+    parser = argparse.ArgumentParser(description="Find and measure stars.")
+    parser.add_argument("image", help="Path to an image file or a directory of images.")
+    parser.add_argument("--astrometry", action="store_true")
+    parser.add_argument("--api-key", default="aifriketqrtctpor")
+    parser.add_argument("--fwhm", type=float, default=3.0)
+    parser.add_argument("--threshold", type=float, default=5.0)
+    parser.add_argument("--cores", type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--absolute", action="store_true")
+    parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
+    args = parser.parse_args()
+
+    # Determine input type
+    image_list = []
+    if os.path.isdir(args.image):
+        print(f"Directory detected: {args.image}")
+        extensions = ('.bmp', '.jpg', '.jpeg', '.png', '.tif', '.tiff', '.fits', '.fit')
+        for f in os.listdir(args.image):
+            if f.lower().endswith(extensions):
+                image_list.append(os.path.join(args.image, f))
+        
+        output_base = args.image
+        image_list.sort()
+    else:
+        if os.path.exists(args.image):
+            image_list = [args.image]
+            output_base = os.path.dirname(args.image) if os.path.dirname(args.image) else "."
+        else:
+            print(f"Error: Path {args.image} does not exist.")
+            return
+
+    if not image_list:
+        print("No valid images found to process.")
+        return
+
+    # Create output directories
+    figures_dir = os.path.join(output_base, 'Figures')
+    csvs_dir = os.path.join(output_base, 'CSVs')
+    
+    for d in [figures_dir, csvs_dir]:
+        if not os.path.exists(d):
+            os.makedirs(d)
+
+    print(f"Found {len(image_list)} images to process.")
+    for img in image_list:
+        process_image(img, args, figures_dir, csvs_dir)
+
+    print("\nBatch processing complete.")
 
 if __name__ == "__main__":
     main()
