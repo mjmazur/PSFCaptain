@@ -4,9 +4,15 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 
 ## Features
 
-- **Multi-Format Support**: Process `.fits`, `.fit`, `.png`, and `.bmp` images.
-- **Robust Star Detection**: Utilizes `photutils.detection.DAOStarFinder` for accurate source identification.
-- **High-Performance Processing**: Built-in multiprocessing support (`--cores`) for fast analysis on multi-core systems.
+- **Multi-Format Support**: Process `.fits`, `.fit`, `.png`, `.jpg`, and `.bmp` images.
+- **Batch Processing**: Automatically process entire directories of images. Results are neatly organized into `Figures/` and `CSVs/` subfolders.
+- **Advanced Star Detection**:
+  - **DAOStarFinder**: Standard Gaussian-PSF detection.
+  - **IRAFStarFinder**: Robust detection for bright or saturated stars.
+  - **2D Background Suppression**: Optional local sky estimation (`--sky`) for improved detection in varied fields.
+- **High-Performance Processing**:
+  - **Intelligent Parallelism**: Parallel image processing for batches; star-level parallel morphology for single images.
+  - **Vectorized WCS**: Blazing fast coordinate and distortion map generation.
 - **Precision Photometry**: Performs aperture photometry to calculate instrumental magnitudes.
 - **Absolute Photometry**: Calibrate your data against international catalogs:
   - **Gaia G-band**: Best for medium to faint stars.
@@ -35,6 +41,28 @@ conda activate rms
 # Install dependencies
 pip install numpy==1.26.4 pandas matplotlib astropy photutils astroquery pillow
 ```
+
+### Batch Processing (Directory)
+Process all images in a folder and organize outputs:
+```bash
+python star_measure.py path/to/images/ --cores 8 --sky --finder iraf
+```
+
+### Absolute Photometry (Calibration)
+To calibrate your magnitudes, you must first solve for astrometry. You can choose between Gaia and Tycho-2 catalogs:
+```bash
+# Calibrate against Gaia (Default)
+python star_measure.py image.fits --astrometry --absolute
+
+# Calibrate against Tycho-2 (Recommended for bright stars mag 0-9)
+python star_measure.py image.fits --astrometry --absolute --catalog tycho2
+```
+
+### Performance Tuning
+The script automatically parallelizes work based on the input:
+- **Directory Input**: Processes multiple images concurrently.
+- **Single Image**: Processes stars within the image concurrently.
+The default core count is `CPU_COUNT - 2` to maintain system stability.
 
 ## Usage
 
@@ -78,14 +106,23 @@ Saved in the `Figures/` directory:
 - `[image_name]_psf_arcsec_map.png`: 2D heatmap of PSF size in arcseconds.
 - `[image_name]_distortion_map.png`: 2D heatmap of local pixel scale.
 
-## Parameters
+### Detection & Processing
 - `--fwhm`: Expected FWHM in pixels (default: 3.0).
 - `--threshold`: Detection threshold in sigma (default: 5.0).
-- `--cores`: Number of CPU cores to use.
+- `--finder`: Choose `dao` or `iraf` detection algorithm.
+- `--sky`: Enable 2D local background estimation (improves detection in uneven fields).
+- `--cores`: Number of CPU cores to use (default: CPU_COUNT - 2).
+- `--exclude-border`: Ignore stars detected near the image edges.
+
+### Calibration & Analysis
 - `--astrometry`: Solve for RA/Dec via Astrometry.net.
 - `--absolute`: Perform absolute photometry calibration.
 - `--catalog`: Choose `gaia` or `tycho2`.
 - `--api-key`: Astrometry.net API key.
+
+### Fine-Tuning Detection
+- `--sharplo`/`--sharphi`: Sharpness bounds for star detection (default 0.2 to 1.0).
+- `--roundlo`/`--roundhi`: Roundness bounds for star detection (default -1.0 to 1.0).
 
 ## Performance Note
 The script automatically limits Intel MKL and OpenMP threading to 1 thread per process when using multiprocessing. This prevents "Paging file is too small" errors and memory exhaustion on Windows systems.

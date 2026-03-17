@@ -16,7 +16,8 @@ from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord, match_coordinates_sky
 from astropy import units as u
-from photutils.detection import DAOStarFinder
+from photutils.detection import DAOStarFinder, IRAFStarFinder
+from photutils.background import Background2D, MedianBackground
 from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
 from photutils.morphology import data_properties
 from PIL import Image
@@ -260,14 +261,31 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         print(f"Error loading {image_path}: {e}")
         return
 
-    # Basic stats for background subtraction
-    mean, median, std = sigma_clipped_stats(data, sigma=3.0)
-    data_sub = data - median
+    # Background subtraction
+    if args.sky:
+        print("Estimating local background...")
+        bkg_estimator = MedianBackground()
+        # box size of ~50 is a reasonable default for star fields
+        bkg = Background2D(data, (50, 50), filter_size=(3, 3), bkg_estimator=bkg_estimator)
+        mean, median, std = np.median(bkg.background), np.median(bkg.background_median), np.median(bkg.background_rms)
+        data_sub = data - bkg.background
+    else:
+        mean, median, std = sigma_clipped_stats(data, sigma=3.0)
+        data_sub = data - median
 
     # Star Detection
-    print("Finding stars...")
-    daofind = DAOStarFinder(fwhm=args.fwhm, threshold=args.threshold * std)
-    sources = daofind(data_sub)
+    print(f"Finding stars (using {args.finder.upper()} finder)...")
+    if args.finder == 'dao':
+        finder = DAOStarFinder(fwhm=args.fwhm, threshold=args.threshold * std,
+                               sharplo=args.sharplo, sharphi=args.sharphi,
+                               roundlo=args.roundlo, roundhi=args.roundhi,
+                               exclude_border=args.exclude_border)
+    else:
+        finder = IRAFStarFinder(fwhm=args.fwhm, threshold=args.threshold * std,
+                                sharplo=args.sharplo, sharphi=args.sharphi,
+                                roundlo=args.roundlo, roundhi=args.roundhi,
+                                exclude_border=args.exclude_border)
+    sources = finder(data_sub)
 
     if sources is None or len(sources) == 0:
         print("No stars found.")
@@ -663,6 +681,14 @@ def main():
     parser.add_argument("--api-key", default="aifriketqrtctpor")
     parser.add_argument("--fwhm", type=float, default=3.0)
     parser.add_argument("--threshold", type=float, default=5.0)
+    parser.add_argument("--finder", choices=["dao", "iraf"], default="dao", 
+                        help="Star detection algorithm (DAOStarFinder or IRAFStarFinder).")
+    parser.add_argument("--sharplo", type=float, default=0.2, help="Lower bound for sharpness (default 0.2).")
+    parser.add_argument("--sharphi", type=float, default=1.0, help="Upper bound for sharpness (default 1.0).")
+    parser.add_argument("--roundlo", type=float, default=-1.0, help="Lower bound for roundness (default -1.0).")
+    parser.add_argument("--roundhi", type=float, default=1.0, help="Upper bound for roundness (default 1.0).")
+    parser.add_argument("--exclude-border", action="store_true", help="Exclude stars found near image border.")
+    parser.add_argument("--sky", action="store_true", help="Use local background estimation instead of global median.")
     parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2))
     parser.add_argument("--absolute", action="store_true")
     parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
