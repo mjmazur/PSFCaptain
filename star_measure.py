@@ -240,8 +240,10 @@ def query_catalog_tiled(center_sky, radius_deg, catalog_name="gaia", tile_size_d
     combined = vstack(all_results)
     # Remove duplicates based on coordinates (rounded to avoid precision issues)
     # Different catalogs have different ID columns, so coordinates are a safe bet.
-    combined['tmp_ra_round'] = np.round(combined['ra'] if 'ra' in combined.colnames else combined['RA(ICRS)'], 6)
-    combined['tmp_dec_round'] = np.round(combined['dec'] if 'dec' in combined.colnames else combined['DE(ICRS)'], 6)
+    ra_col = combined['ra'] if 'ra' in combined.colnames else combined['RA(ICRS)']
+    dec_col = combined['dec'] if 'dec' in combined.colnames else combined['DE(ICRS)']
+    combined['tmp_ra_round'] = np.round(np.asarray(ra_col), 6)
+    combined['tmp_dec_round'] = np.round(np.asarray(dec_col), 6)
     
     final_table = unique(combined, keys=['tmp_ra_round', 'tmp_dec_round'])
     final_table.remove_columns(['tmp_ra_round', 'tmp_dec_round'])
@@ -294,22 +296,34 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     if num_clipped > 0:
         print(f"Clipped {num_clipped} stars with non-positive flux. {len(df)} stars remaining.")
 
-    # PSF Morphometry (Multiprocessing)
-    print(f"Measuring morphology using {args.cores} cores...")
+    # PSF Morphometry
+    print(f"Measuring morphology...")
     star_tasks = []
     for i, (idx, row) in enumerate(df.iterrows()):
         x, y = row['xcentroid'], row['ycentroid']
         size = int(args.fwhm * 5)
-        x_min, x_max = max(0, int(x - size)), min(data.shape[1], int(x + size))
-        y_min, y_max = max(0, int(y - size)), min(data.shape[0], int(y + size))
+        x_min, x_max = max(0, int(x - size)), min(nx, int(x + size))
+        y_min, y_max = max(0, int(y - size)), min(ny, int(y + size))
         cutout = data_sub[y_min:y_max, x_min:x_max]
         star_tasks.append((i, x, y, row['mag_instr'], cutout, std, wcs))
 
     results = [None] * len(df)
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.cores) as executor:
-        futures = [executor.submit(process_single_star, *task) for task in star_tasks]
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
+    
+    # Adaptive multiprocessing: Only use a pool for stars if we are NOT already in an image-level pool
+    # We can check if 'IMAGE_POOL' is in the environment
+    is_image_parallel = os.environ.get("IMAGE_POOL", "0") == "1"
+    
+    if args.cores > 1 and not is_image_parallel and len(df) > 50:
+        print(f"  (Processing {len(df)} stars using {args.cores} cores)")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.cores) as executor:
+            futures = [executor.submit(process_single_star, *task) for task in star_tasks]
+            for future in concurrent.futures.as_completed(futures):
+                res = future.result()
+                results[res['index']] = res
+    else:
+        # Sequential morphology
+        for task in star_tasks:
+            res = process_single_star(*task)
             results[res['index']] = res
     
     # Merge results
@@ -347,7 +361,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     cat_mag = catalog_results['VTmag']
                     mag_label = "Tycho-2 VT"
 
-                catalog_coords = SkyCoord(ra=cat_ra*u.deg, dec=cat_dec*u.deg)
+                catalog_coords = SkyCoord(ra=cat_ra, dec=cat_dec, unit=u.deg)
                 star_coords = wcs.pixel_to_world(df['xcentroid'], df['ycentroid'])
                 
                 # Match
@@ -370,12 +384,12 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     if fit_mask.sum() > 5:
                         print(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < -7...")
                         x_fit = matched_df[fit_mask]['mag_instr'].values.reshape(-1, 1)
-                        y_fit = matched_cat_mag[fit_mask].values
+                        y_fit = np.asarray(matched_cat_mag[fit_mask])
                     else:
                         if fit_mask.sum() > 0:
                             print(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < -7. Using all {len(matched_df)} matched stars for fit.")
                         x_fit = matched_df['mag_instr'].values.reshape(-1, 1)
-                        y_fit = matched_cat_mag.values
+                        y_fit = np.asarray(matched_cat_mag)
 
                     from sklearn.linear_model import RANSACRegressor
                     ransac = RANSACRegressor()
@@ -410,7 +424,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     plt.xlabel("Instrumental Magnitude")
                     plt.ylabel(f"Catalog Magnitude ({mag_label})")
                     plt.title(f"Absolute Photometry Calibration - {os.path.basename(image_path)}")
-                    plt.legend()
+                    plt.legend(loc='lower right')
                     plt.grid(True, alpha=0.3)
                     
                     # Add stats text
@@ -460,21 +474,22 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_fwhm_map.png'), bbox_inches='tight')
         plt.close()
 
-        # PSF Arcsec Map (if WCS available)
         if wcs:
-            print("Generating PSF arcsec map...")
-            avg_fwhm_px = df['fwhm'].mean()
-            # Calculate local pixel scale at each star
-            all_local_scales = []
-            for _, row in df.iterrows():
-                x, y = row['xcentroid'], row['ycentroid']
-                s1 = wcs.pixel_to_world(x, y)
-                s2 = wcs.pixel_to_world(x + 1, y)
-                s3 = wcs.pixel_to_world(x, y + 1)
-                local_scale = np.sqrt(s1.separation(s2).arcsec * s1.separation(s3).arcsec)
-                all_local_scales.append(local_scale)
+            print("Generating PSF arcsec map (vectorized)...")
+            # Vectorized local pixel scale calculation
+            all_x = df['xcentroid'].values
+            all_y = df['ycentroid'].values
             
-            df['fwhm_arc'] = df['fwhm'] * np.array(all_local_scales)
+            sky_c = wcs.pixel_to_world(all_x, all_y)
+            sky_x = wcs.pixel_to_world(all_x + 1, all_y)
+            sky_y = wcs.pixel_to_world(all_x, all_y + 1)
+            
+            # separation returns Angle instances; we want arcseconds
+            sep_x = sky_c.separation(sky_x).arcsec
+            sep_y = sky_c.separation(sky_y).arcsec
+            local_scales = np.sqrt(sep_x * sep_y)
+            
+            df['fwhm_arc'] = df['fwhm'] * local_scales
             
             plt.figure(figsize=(10, 8))
             grid_fwhm_arc = griddata((df['xcentroid'], df['ycentroid']), df['fwhm_arc'], (grid_x, grid_y), method='cubic')
@@ -514,16 +529,17 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         center_scale_y = s1_c.separation(s3_c).arcsec
         center_scale_avg = np.sqrt(center_scale_x * center_scale_y)
         
-        print(f"Calculating local distortion vectors (ref: {center_scale_avg:.3f}\"/pix at center)...")
-        for i in range(gx.shape[0]):
-            for j in range(gx.shape[1]):
-                x0, y0 = gx[i, j], gy[i, j]
-                sky1 = wcs.pixel_to_world(x0, y0)
-                sky2 = wcs.pixel_to_world(x0 + 1, y0)
-                sky3 = wcs.pixel_to_world(x0, y0 + 1)
-                scale_x = sky1.separation(sky2).arcsec
-                scale_y = sky1.separation(sky3).arcsec
-                scales[i, j] = np.sqrt(scale_x * scale_y)
+        # Vectorized grid sampling
+        all_gx = gx.flatten()
+        all_gy = gy.flatten()
+        
+        sky1_all = wcs.pixel_to_world(all_gx, all_gy)
+        sky2_all = wcs.pixel_to_world(all_gx + 1, all_gy)
+        sky3_all = wcs.pixel_to_world(all_gx, all_gy + 1)
+        
+        scale_x = sky1_all.separation(sky2_all).arcsec
+        scale_y = sky1_all.separation(sky3_all).arcsec
+        scales = np.sqrt(scale_x * scale_y).reshape(gx.shape)
         
         # Calculate the gradient of the scale field
         grad_y, grad_x = np.gradient(scales)
@@ -647,7 +663,7 @@ def main():
     parser.add_argument("--api-key", default="aifriketqrtctpor")
     parser.add_argument("--fwhm", type=float, default=3.0)
     parser.add_argument("--threshold", type=float, default=5.0)
-    parser.add_argument("--cores", type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2))
     parser.add_argument("--absolute", action="store_true")
     parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
     args = parser.parse_args()
@@ -684,8 +700,19 @@ def main():
             os.makedirs(d)
 
     print(f"Found {len(image_list)} images to process.")
-    for img in image_list:
-        process_image(img, args, figures_dir, csvs_dir)
+    
+    if args.cores > 1 and len(image_list) > 1:
+        print(f"Processing images in parallel using {args.cores} workers...")
+        # Mark that we are in a parallel image loop to avoid nested pools
+        os.environ["IMAGE_POOL"] = "1"
+        with concurrent.futures.ProcessPoolExecutor(max_workers=args.cores) as executor:
+            # We must use wraps or partial to pass extra args
+            from functools import partial
+            worker = partial(process_image, args=args, figures_dir=figures_dir, csvs_dir=csvs_dir)
+            list(executor.map(worker, image_list))
+    else:
+        for img in image_list:
+            process_image(img, args, figures_dir, csvs_dir)
 
     print("\nBatch processing complete.")
 
