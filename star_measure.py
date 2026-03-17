@@ -154,6 +154,7 @@ def main():
 
     # Measurements
     results = []
+    all_local_scales = []  # To collect plate scale measurements from each star
     positions = np.transpose((sources['xcentroid'], sources['ycentroid']))
     apertures = CircularAperture(positions, r=args.fwhm * 1.5)
     annulus_aperture = CircularAnnulus(positions, r_in=args.fwhm * 2, r_out=args.fwhm * 3)
@@ -190,35 +191,54 @@ def main():
                 pass
 
         # Estimate local morphology (FWHM, elongation, theta)
-        size = int(args.fwhm * 5)
+        # Use a more targeted cutout size (3x the initial FWHM estimate)
+        size = int(args.fwhm * 3)
         x_min, x_max = max(0, int(x - size)), min(data.shape[1], int(x + size))
         y_min, y_max = max(0, int(y - size)), min(data.shape[0], int(y + size))
         cutout = data_sub[y_min:y_max, x_min:x_max]
         
         try:
-            props = data_properties(cutout)
-            # Use getattr to safely get values from Quantities
-            fwhm = props.fwhm
-            if hasattr(fwhm, 'value'): fwhm = fwhm.value
+            # Apply a threshold mask to isolate the star from background noise
+            # This is critical for moment-based measurements in noisy/compressed images
+            mask = cutout < (2 * std) # Slightly lower threshold for cutout isolation
+            props = data_properties(cutout, mask=mask)
             
-            elongation = props.elongation
-            if hasattr(elongation, 'value'): elongation = elongation.value
+            # Use getattr to safely get values from Quantities and handle failures
+            fwhm = props.fwhm.value if hasattr(props.fwhm, 'value') else props.fwhm
+            elongation = props.elongation.value if hasattr(props.elongation, 'value') else props.elongation
+            theta = props.orientation.deg if hasattr(props.orientation, 'deg') else (
+                    props.orientation.value if hasattr(props.orientation, 'value') else props.orientation)
             
-            theta = props.orientation
-            if hasattr(theta, 'deg'): 
-                theta = theta.deg
-            elif hasattr(theta, 'value'):
-                theta = theta.value
-            
-            # Final conversion to float, handling any remaining Quantity issues
+            # Final conversion to float
             fwhm = float(np.array(fwhm))
             elongation = float(np.array(elongation))
             theta = float(np.array(theta))
+            
+            # If photometry failed or FWHM is invalid, mark it
+            if phot_table['mag_instr'][i] > 14.99 or np.isnan(fwhm):
+                fwhm, elongation, theta = -999.0, -999.0, -999.0
+            
+            # Calculate fwhm_arcsec if wcs is available
+            fwhm_arcsec = -999.0
+            if wcs and fwhm != -999:
+                try:
+                    # Local pixel scale at (x, y)
+                    sky1 = wcs.pixel_to_world(x, y)
+                    sky2 = wcs.pixel_to_world(x + 1, y)
+                    sky3 = wcs.pixel_to_world(x, y + 1)
+                    scale_x = sky1.separation(sky2).arcsec
+                    scale_y = sky1.separation(sky3).arcsec
+                    local_scale = np.sqrt(scale_x * scale_y)
+                    fwhm_arcsec = fwhm * local_scale
+                    all_local_scales.append(local_scale)
+                except:
+                    pass
             
         except Exception as e:
             if i < 5: # Only print for first 5 stars to avoid spam
                 print(f"Morphology failed for star at ({x:.1f}, {y:.1f}): {e}")
             fwhm, elongation, theta = -999, -999, -999
+            fwhm_arcsec = -999.0
 
         results.append({
             'x': float(x),
@@ -227,6 +247,7 @@ def main():
             'dec': float(dec),
             'mag_instr': float(mag_instr[i]),
             'fwhm': float(fwhm),
+            'fwhm_arcsec': float(fwhm_arcsec),
             'elongation': float(elongation),
             'theta': float(theta)
         })
@@ -234,8 +255,13 @@ def main():
     # Save to CSV
     df = pd.DataFrame(results)
     csv_name = f"{args.image}_results.csv"
-    df.to_csv(csv_name, index=False)
-    print(f"Results saved to {csv_name}")
+    try:
+        df.to_csv(csv_name, index=False)
+        print(f"Results saved to {csv_name}")
+    except PermissionError:
+        print(f"!!! Error: Could not save CSV to {csv_name}. Please ensure the file is not open in another program.")
+    except Exception as e:
+        print(f"!!! Error saving CSV: {e}")
 
     # Plotting
     print("Generating figures...")
@@ -281,26 +307,55 @@ def main():
                              (grid_x, grid_y), method='linear')
         
         plt.figure(figsize=(10, 8))
-        im = plt.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        plt.colorbar(im, label='FWHM (pixels)')
-        plt.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
-        plt.title(f"Interpolated PSF Size (FWHM) - {os.path.basename(args.image)}")
-        plt.xlabel("X (pixels)")
-        plt.ylabel("Y (pixels)")
+        ax = plt.gca()
+        im = ax.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.1)
+        plt.colorbar(im, cax=cax, label='FWHM (pixels)')
+        ax.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
+        ax.set_title(f"Interpolated PSF Size (FWHM) - {os.path.basename(args.image)}")
+        ax.set_xlabel("X (pixels)")
+        ax.set_ylabel("Y (pixels)")
         plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_psf_size_map.png'))
         plt.close()
+
+        # PSF Arcsec Map
+        valid_arcsec_df = valid_df[valid_df['fwhm_arcsec'] != -999.0]
+        if len(valid_arcsec_df) >= 4:
+            print("Generating PSF arcsec map...")
+            grid_fwhm_arc = griddata((valid_arcsec_df['x'], valid_arcsec_df['y']), valid_arcsec_df['fwhm_arcsec'], 
+                                     (grid_x, grid_y), method='linear')
+            
+            plt.figure(figsize=(10, 8))
+            ax = plt.gca()
+            im = ax.imshow(grid_fwhm_arc.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="5%", pad=0.1)
+            plt.colorbar(im, cax=cax, label='FWHM (arcseconds)')
+            ax.scatter(valid_arcsec_df['x'], valid_arcsec_df['y'], c='red', s=5, alpha=0.3)
+            ax.set_title(f"Interpolated PSF Size (Arcseconds) - {os.path.basename(args.image)}")
+            ax.set_xlabel("X (pixels)")
+            ax.set_ylabel("Y (pixels)")
+            plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_psf_arcsec_map.png'))
+            plt.close()
 
         # Theta Map
         grid_theta = griddata((valid_df['x'], valid_df['y']), valid_df['theta'], 
                               (grid_x, grid_y), method='linear')
         
         plt.figure(figsize=(10, 8))
-        im = plt.imshow(grid_theta.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        plt.colorbar(im, label='Orientation (degrees)')
-        plt.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
-        plt.title(f"Interpolated PSF Orientation (Theta) - {os.path.basename(args.image)}")
-        plt.xlabel("X (pixels)")
-        plt.ylabel("Y (pixels)")
+        ax = plt.gca()
+        im = ax.imshow(grid_theta.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.1)
+        plt.colorbar(im, cax=cax, label='Orientation (degrees)')
+        ax.scatter(valid_df['x'], valid_df['y'], c='red', s=5, alpha=0.3)
+        ax.set_title(f"Interpolated PSF Orientation (Theta) - {os.path.basename(args.image)}")
+        ax.set_xlabel("X (pixels)")
+        ax.set_ylabel("Y (pixels)")
         plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_theta_map.png'))
         plt.close()
     else:
@@ -334,15 +389,96 @@ def main():
                              (grid_x_f, grid_y_f), method='cubic')
         
         plt.figure(figsize=(10, 8))
-        im = plt.imshow(grid_dist.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
-        plt.colorbar(im, label='Local Pixel Scale (arcsec/pixel)')
-        plt.title(f"Field Distortion (Local Pixel Scale) - {os.path.basename(args.image)}")
-        plt.xlabel("X (pixels)")
-        plt.ylabel("Y (pixels)")
+        ax = plt.gca()
+        im = ax.imshow(grid_dist.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.1)
+        plt.colorbar(im, cax=cax, label='Local Pixel Scale (arcsec/pixel)')
+        ax.set_title(f"Field Distortion (Local Pixel Scale) - {os.path.basename(args.image)}")
+        ax.set_xlabel("X (pixels)")
+        ax.set_ylabel("Y (pixels)")
         plt.savefig(os.path.join('Figures', f'{os.path.basename(args.image)}_distortion_map.png'))
         plt.close()
     else:
         print("Astrometry not solved; cannot generate distortion map.")
+
+    # Summary Overlay Figure
+    print("Generating summary overlay figure...")
+    plt.figure(figsize=(12, 10))
+    # Use log scaling for background if visibility is an issue
+    bg_data = data_sub + median
+    # Clip and normalize for display
+    vmin, vmax = np.percentile(bg_data, [1, 99.5])
+    plt.imshow(bg_data, origin='lower', cmap='gray', vmin=vmin, vmax=vmax, interpolation='nearest')
+    
+    # Overlay stars
+    from matplotlib.patches import Circle
+    valid_df = df[df['fwhm'] != -999]
+    for _, row in valid_df.iterrows():
+        # Radius = 2 * FWHM leads to Diameter = 4x FWHM
+        circle = Circle((row['x'], row['y']), radius=row['fwhm'] * 2.0, color='red', fill=False, linewidth=1, alpha=0.6)
+        plt.gca().add_patch(circle)
+    
+    # Information Box
+    fwhm_px = valid_df['fwhm'].values
+    fwhm_arc = valid_df[valid_df['fwhm_arcsec'] != -999.0]['fwhm_arcsec'].values
+    
+    def fmt_stats(px_list, arc_list, func):
+        if len(px_list) == 0: return "N/A"
+        px = func(px_list)
+        if len(arc_list) > 0:
+            arc = func(arc_list)
+            return f"{px:.2f} ({arc:.2f}\")"
+        return f"{px:.2f}"
+
+    # Calculate average scale if WCS is available
+    if wcs:
+        # Prioritize the collection of individual star scales for the most accurate average
+        if 'all_local_scales' in locals() and len(all_local_scales) > 0:
+            avg_scale = np.mean(all_local_scales)
+        elif 'scales' in locals():
+            avg_scale = np.mean(scales)
+        else:
+            try:
+                ny, nx = data.shape
+                sky1 = wcs.pixel_to_world(nx/2, ny/2)
+                sky2 = wcs.pixel_to_world(nx/2 + 1, ny/2)
+                sky3 = wcs.pixel_to_world(nx/2, ny/2 + 1)
+                avg_scale = np.sqrt(sky1.separation(sky2).arcsec * sky1.separation(sky3).arcsec)
+            except:
+                avg_scale = -999.0
+    else:
+        avg_scale = -999.0
+
+    scale_str = f"{avg_scale:.3f} \"/pix" if avg_scale != -999.0 else "N/A"
+    
+    info_text = (
+        f"Image: {os.path.basename(args.image)}\n"
+        f"Size: {nx} x {ny} px\n"
+        f"Scale: {scale_str}\n\n"
+        f"FWHM: pixels (arcseconds)\n"
+        f"  Min: {fmt_stats(fwhm_px, fwhm_arc, np.min)}\n"
+        f"  Max: {fmt_stats(fwhm_px, fwhm_arc, np.max)}\n"
+        f"  Avg: {fmt_stats(fwhm_px, fwhm_arc, np.mean)}\n"
+        f"  Std: {fmt_stats(fwhm_px, fwhm_arc, np.std)}\n\n"
+        f"Background:\n"
+        f"  Mean: {median:.2f}\n"
+        f"  Std: {std:.2f}"
+    )
+    
+    # Add box to plot
+    plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, 
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+             fontsize=10, fontfamily='monospace')
+    
+    plt.title(f"Star Detection Summary - {os.path.basename(args.image)}")
+    plt.xlabel("X (pixels)")
+    plt.ylabel("Y (pixels)")
+    summary_name = os.path.join('Figures', f'{os.path.basename(args.image)}_summary.png')
+    plt.savefig(summary_name, dpi=150)
+    plt.close()
+    print(f"Summary figure saved to {summary_name}")
 
     print("Done.")
 

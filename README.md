@@ -49,6 +49,21 @@ python star_measure.py path/to/your_image.png --astrometry
 python star_measure.py path/to/your_image.png --astrometry --api-key YOUR_API_KEY
 ```
 
+## Utility Tools
+
+### FITS Binning
+Use `bin_fits.py` to downsample large FITS files. This is useful for speeding up astrometry or reducing noise.
+```bash
+# Default 2x2 binning (averaging)
+python bin_fits.py path/to/your_image.fits
+
+# Specific 4x4 binning
+python bin_fits.py path/to/your_image.fits --bin 4
+
+# Using summation instead of averaging
+python bin_fits.py path/to/your_image.fits --method sum
+```
+
 ## Output
 
 The script generates the following outputs:
