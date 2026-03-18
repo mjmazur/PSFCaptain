@@ -7,8 +7,10 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 - **Multi-Format Support**: Process `.fits`, `.fit`, `.png`, `.jpg`, and `.bmp` images.
 - **Batch Processing**: Automatically process entire directories of images. Results are neatly organized into `Figures/` and `CSVs/` subfolders.
 - **Advanced Star Detection**:
+  - **RMSStarFinder**: Full geometric bounding, optimal flux calculations mapped directly from Pi in the Sky methodologies.
   - **DAOStarFinder**: Standard Gaussian-PSF detection.
   - **IRAFStarFinder**: Robust detection for bright or saturated stars.
+  - **Two-Pass Photometry**: Cascade two finding methods together (e.g. `--finder rms iraf`) to derive structural mappings from the first pass and high-efficiency fluxes from the second.
   - **2D Background Suppression**: Optional local sky estimation (`--sky`) for improved detection in varied fields.
 - **High-Performance Processing**:
   - **Intelligent Parallelism**: Parallel image processing for batches; star-level parallel morphology for single images.
@@ -99,17 +101,21 @@ A file named `[image_name]_results.csv` containing:
 - `elongation`, `theta`: Star shape characteristics.
 
 ### 2. Figures
-Saved in the `Figures/` directory:
-- `[image_name]_summary.png`: Star field overlay with detection circles and image statistics.
+Saved in the `Figures/` root directory:
+- `[image_name]_summary.png`: Master star field overlay with red/green detection circles and metrics box.
+
+Saved in the `Figures/Individuals/` rendering directory:
 - `[image_name]_mag_comparison.png`: Diagnostic plot of Catalog vs Instrumental magnitude.
 - `[image_name]_abs_mag_hist.png`: Histogram of calibrated magnitudes.
 - `[image_name]_psf_arcsec_map.png`: 2D heatmap of PSF size in arcseconds.
 - `[image_name]_distortion_map.png`: 2D heatmap of local pixel scale.
+- Single metric maps (e.g. FWHM pixels, Theta maps, simple detection outlines) are also pushed here.
 
 ### Detection & Processing
 - `--fwhm`: Expected FWHM in pixels (default: 3.0).
 - `--threshold`: Detection threshold in sigma (default: 5.0).
-- `--finder`: Choose `dao` or `iraf` detection algorithm.
+- `--gamma`: Corrects linear flux for gamma (default 1.0, specifically for `--finder rms`).
+- `--finder`: Choose detection algorithm (`dao`, `iraf`, `rms`). You can queue two algorithms separated by a space (e.g., `--finder rms iraf`) to trigger **Two-Pass Photometry** cross matching.
 - `--sky`: Enable 2D local background estimation (improves detection in uneven fields).
 - `--cores`: Number of CPU cores to use (default: CPU_COUNT - 2).
 - `--exclude-border`: Ignore stars detected near the image edges.

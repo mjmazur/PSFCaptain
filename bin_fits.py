@@ -68,68 +68,98 @@ def update_header(header, bin_factor, method='average'):
     new_header.add_history(f"Binned by factor {bin_factor} using {method}")
     return new_header
 
+def process_file(input_path, output_path, bin_factor, method):
+    print(f"Processing {input_path}...")
+    try:
+        with fits.open(input_path) as hdul:
+            data = hdul[0].data
+            header = hdul[0].header
+            
+            if data is None:
+                # Check other HDUs
+                for hdu in hdul[1:]:
+                    if hdu.data is not None:
+                        data = hdu.data
+                        header = hdu.header
+                        break
+            
+            if data is None:
+                print("Error: No image data found in FITS file.")
+                return
+
+            print(f"Original shape: {data.shape} ({data.dtype})")
+            binned_data = bin_image(data, bin_factor, method)
+            
+            # By default, cast back to 16-bit if it was integer-like, or if requested.
+            # This ensures 2x2 binning results in 1/4 file size.
+            original_is_int = np.issubdtype(data.dtype, np.integer)
+            
+            if original_is_int:
+                # Round and clip to original integer range to prevent overflow/artifacts
+                # Most astronomical images are uint16 (0-65535)
+                if data.dtype == np.uint16:
+                    binned_data = np.clip(np.round(binned_data), 0, 65535).astype(np.uint16)
+                else:
+                    binned_data = np.round(binned_data).astype(data.dtype)
+                print(f"Binned shape: {binned_data.shape} (Casted to {binned_data.dtype})")
+            else:
+                # If original was float, keep as float32 to save space over float64
+                if binned_data.dtype == np.float64:
+                    binned_data = binned_data.astype(np.float32)
+                print(f"Binned shape: {binned_data.shape} ({binned_data.dtype})")
+            
+            new_header = update_header(header, bin_factor, method)
+            
+            if not output_path:
+                base, ext = os.path.splitext(input_path)
+                output_path = f"{base}_bin{bin_factor}{ext}"
+                
+            new_hdu = fits.PrimaryHDU(data=binned_data, header=new_header)
+            new_hdu.writeto(output_path, overwrite=True)
+            print(f"Binned image saved to {output_path}")
+    except Exception as e:
+        print(f"Error processing {input_path}: {e}")
+
 def main():
-    parser = argparse.ArgumentParser(description="Bin a FITS image.")
-    parser.add_argument("input", help="Input FITS file path")
+    parser = argparse.ArgumentParser(description="Bin a FITS image or directory of FITS images.")
+    parser.add_argument("input", help="Input FITS file path or directory path")
     parser.add_argument("--bin", type=int, default=2, help="Binning factor (default: 2)")
     parser.add_argument("--method", choices=['average', 'sum'], default='average', 
                         help="Binning method (default: average)")
-    parser.add_argument("-o", "--output", help="Output FITS file path (default: [input]_binned.fits)")
+    parser.add_argument("-o", "--output", help="Output FITS file path (default for single file: [input]_binned.fits)")
     
     args = parser.parse_args()
     
     if not os.path.exists(args.input):
-        print(f"Error: File {args.input} not found.")
+        print(f"Error: Path {args.input} not found.")
         return
 
-    print(f"Processing {args.input}...")
-    with fits.open(args.input) as hdul:
-        data = hdul[0].data
-        header = hdul[0].header
+    if os.path.isdir(args.input):
+        print(f"Directory detected: {args.input}")
+        extensions = ('.fits', '.fit')
         
-        if data is None:
-            # Check other HDUs
-            for hdu in hdul[1:]:
-                if hdu.data is not None:
-                    data = hdu.data
-                    header = hdu.header
-                    break
-        
-        if data is None:
-            print("Error: No image data found in FITS file.")
+        image_list = []
+        for f in os.listdir(args.input):
+            if f.lower().endswith(extensions):
+                image_list.append(os.path.join(args.input, f))
+                
+        if not image_list:
+            print(f"No FITS images found in {args.input}.")
             return
-
-        print(f"Original shape: {data.shape} ({data.dtype})")
-        binned_data = bin_image(data, args.bin, args.method)
-        
-        # By default, cast back to 16-bit if it was integer-like, or if requested.
-        # This ensures 2x2 binning results in 1/4 file size.
-        original_is_int = np.issubdtype(data.dtype, np.integer)
-        
-        if original_is_int:
-            # Round and clip to original integer range to prevent overflow/artifacts
-            # Most astronomical images are uint16 (0-65535)
-            if data.dtype == np.uint16:
-                binned_data = np.clip(np.round(binned_data), 0, 65535).astype(np.uint16)
-            else:
-                binned_data = np.round(binned_data).astype(data.dtype)
-            print(f"Binned shape: {binned_data.shape} (Casted to {binned_data.dtype})")
-        else:
-            # If original was float, keep as float32 to save space over float64
-            if binned_data.dtype == np.float64:
-                binned_data = binned_data.astype(np.float32)
-            print(f"Binned shape: {binned_data.shape} ({binned_data.dtype})")
-        
-        new_header = update_header(header, args.bin, args.method)
-        
-        output_path = args.output
-        if not output_path:
-            base, ext = os.path.splitext(args.input)
-            output_path = f"{base}_bin{args.bin}{ext}"
             
-        new_hdu = fits.PrimaryHDU(data=binned_data, header=new_header)
-        new_hdu.writeto(output_path, overwrite=True)
-        print(f"Binned image saved to {output_path}")
+        print(f"Found {len(image_list)} images to process.")
+        
+        output_dir = os.path.join(args.input, f"binned{args.bin}x{args.bin}")
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            
+        for img_path in sorted(image_list):
+            out_file = os.path.join(output_dir, os.path.basename(img_path))
+            process_file(img_path, out_file, args.bin, args.method)
+            
+        print("\nBatch processing complete.")
+    else:
+        process_file(args.input, args.output, args.bin, args.method)
 
 if __name__ == "__main__":
     main()

@@ -25,6 +25,183 @@ import concurrent.futures
 import multiprocessing
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+def twoDGaussian(params, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
+    """ Defines a 2D Gaussian distribution. """
+    x, y, saturation = params
+
+    if isinstance(saturation, np.ndarray):
+        saturation = saturation[0, 0]
+    
+    xo = float(xo)
+    yo = float(yo)
+
+    a = (np.cos(theta)**2)/(2*sigma_x**2) + (np.sin(theta)**2)/(2*sigma_y**2)
+    b = -(np.sin(2*theta))/(4*sigma_x**2) + (np.sin(2*theta))/(4*sigma_y**2)
+    c = (np.sin(theta)**2)/(2*sigma_x**2) + (np.cos(theta)**2)/(2*sigma_y**2)
+    g = offset + amplitude*np.exp(-(a*((x - xo)**2) + 2*b*(x - xo)*(y - yo) + c*((y - yo)**2)))
+
+    # Limit values to saturation level
+    g[g > saturation] = saturation
+
+    return g.ravel()
+
+@np.vectorize
+def gamma_correction(intensity, gamma, bp=0, wp=255):
+    """ Correct the given intensity for gamma. """
+    if intensity < 0:
+        intensity = 0
+    x = (intensity - bp) / (wp - bp)
+    if x > 0:
+        return bp + (wp - bp) * (x**(1.0/gamma))
+    else:
+        return bp
+
+class RMSStarFinder:
+    def __init__(self, fwhm, threshold, gamma=1.0, neighborhood_size=10, segment_radius=15, roundness_threshold=0.1, max_feature_ratio=2.0, exclude_border=False):
+        self.fwhm = fwhm
+        self.threshold = threshold
+        self.gamma = gamma
+        self.neighborhood_size = neighborhood_size
+        self.segment_radius = segment_radius
+        self.roundness_threshold = roundness_threshold
+        self.max_feature_ratio = max_feature_ratio
+        self.exclude_border = exclude_border
+
+    def __call__(self, data):
+        import scipy.ndimage as ndimage
+        import scipy.optimize as opt
+        from astropy.table import Table
+        
+        # We need a positive data for RMS finder. In star_measure.py, data is background subtracted
+        # calculate image mean
+        avepixel_mean = 0.0 # because it's already background subtracted
+        
+        # Apply a mean filter to the image to reduce noise
+        data_filtered = ndimage.convolve(data.astype(np.float32), weights=np.full((2, 2), 1.0/4))
+        
+        # Locate local maxima on the image
+        data_max = ndimage.maximum_filter(data_filtered, self.neighborhood_size)
+        maxima = (data_filtered == data_max)
+        data_min = ndimage.minimum_filter(data_filtered, self.neighborhood_size)
+        diff = ((data_max - data_min) > self.threshold)
+        maxima[diff == 0] = 0
+        
+        if self.exclude_border:
+            border = int(self.fwhm * 2)
+            border_mask = np.ones_like(maxima)*255
+            border_mask[:border,:] = 0
+            border_mask[-border:,:] = 0
+            border_mask[:,:border] = 0
+            border_mask[:,-border:] = 0
+            maxima[border_mask == 0] = 0
+            
+        # Find and label the maxima
+        labeled, num_objects = ndimage.label(maxima)
+        if num_objects == 0:
+            return None
+            
+        # Find centres of mass of each labeled objects
+        xy = np.array(ndimage.center_of_mass(data_filtered, labeled, range(1, num_objects+1)))
+        
+        if len(xy) == 0:
+            return None
+            
+        # Unpack star coordinates
+        y, x = np.hsplit(xy, 2)
+        y = y.flatten()
+        x = x.flatten()
+        
+        x_fitted = []
+        y_fitted = []
+        amplitude_fitted = []
+        intensity_fitted = []
+        fwhm_fitted = []
+        
+        segment_radius = self.segment_radius
+        ny, nx = data.shape
+        
+        initial_guess = (30.0, segment_radius, segment_radius, 1.0, 1.0, 0.0, avepixel_mean)
+        
+        for yi, xi in zip(y, x):
+            y_min = int(yi - segment_radius)
+            y_max = int(yi + segment_radius)
+            x_min = int(xi - segment_radius)
+            x_max = int(xi + segment_radius)
+            
+            if y_min < 0 or x_min < 0 or y_max > ny or x_max > nx:
+                continue
+                
+            star_seg = data[y_min:y_max, x_min:x_max]
+            y_ind, x_ind = np.indices(star_seg.shape)
+            saturation = np.max(data) * 2 * np.ones_like(y_ind) # Prevent clamping
+            
+            try:
+                import warnings
+                from scipy.optimize import OptimizeWarning
+                with warnings.catch_warnings():
+                    warnings.simplefilter('ignore', OptimizeWarning)
+                    popt, pcov = opt.curve_fit(twoDGaussian, (y_ind, x_ind, saturation), star_seg.ravel(), 
+                                               p0=initial_guess, maxfev=200)
+            except RuntimeError:
+                continue
+                
+            amplitude, yo, xo, sigma_y, sigma_x, theta, offset = popt
+            
+            if min(sigma_y/sigma_x, sigma_x/sigma_y) < self.roundness_threshold:
+                continue
+                
+            if (4*sigma_x*sigma_y/segment_radius**2 > self.max_feature_ratio):
+                continue
+                
+            crop_y_min = int(yo - 3*sigma_y) + 1
+            if crop_y_min < 0: crop_y_min = 0
+            crop_y_max = int(yo + 3*sigma_y) + 1
+            if crop_y_max >= star_seg.shape[0]: crop_y_max = star_seg.shape[0] - 1
+            crop_x_min = int(xo - 3*sigma_x) + 1
+            if crop_x_min < 0: crop_x_min = 0
+            crop_x_max = int(xo + 3*sigma_x) + 1
+            if crop_x_max >= star_seg.shape[1]: crop_x_max = star_seg.shape[1] - 1
+            
+            if (y_max - y_min) < 3:
+                crop_y_min = int(yo - 2)
+                crop_y_max = int(yo + 2)
+            if (x_max - x_min) < 3:
+                crop_x_min = int(xo - 2)
+                crop_x_max = int(xo + 2)
+                
+            star_seg_crop = star_seg[crop_y_min:crop_y_max, crop_x_min:crop_x_max]
+            if star_seg_crop.shape[0] == 0 or star_seg_crop.shape[1] == 0:
+                continue
+                
+            # Gamma correct the star segment and background offset
+            star_seg_crop_corr = gamma_correction(star_seg_crop.astype(np.float32), self.gamma)
+            offset_corr = gamma_correction(offset, self.gamma)
+            
+            intensity = np.sum(star_seg_crop_corr - offset_corr)
+            if intensity <= 0:
+                continue
+                
+            sigma_fitted = np.sqrt(sigma_x**2 + sigma_y**2)
+            fwhm_val = 2.355 * sigma_fitted
+            
+            x_fitted.append(x_min + xo)
+            y_fitted.append(y_min + yo)
+            amplitude_fitted.append(amplitude)
+            intensity_fitted.append(intensity)
+            fwhm_fitted.append(fwhm_val)
+            
+        if not x_fitted:
+            return None
+            
+        t = Table()
+        t['id'] = np.arange(1, len(x_fitted) + 1)
+        t['xcentroid'] = x_fitted
+        t['ycentroid'] = y_fitted
+        t['flux'] = intensity_fitted
+        t['peak'] = amplitude_fitted
+        t['rms_fwhm'] = fwhm_fitted
+        return t
+
 def process_single_star(i, x, y, mag_instr, cutout, std, wcs=None):
     """Worker function to process a single star's morphology and coordinates."""
     try:
@@ -254,6 +431,7 @@ def query_catalog_tiled(center_sky, radius_deg, catalog_name="gaia", tile_size_d
 def process_image(image_path, args, figures_dir, csvs_dir):
     """Processes a single image file."""
     print(f"\n--- Processing: {os.path.basename(image_path)} ---")
+    individuals_dir = os.path.join(figures_dir, 'Individuals')
     try:
         data, header = load_image(image_path)
         ny, nx = data.shape
@@ -274,22 +452,72 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         data_sub = data - median
 
     # Star Detection
-    print(f"Finding stars (using {args.finder.upper()} finder)...")
-    if args.finder == 'dao':
+    finder_args = args.finder if isinstance(args.finder, list) else [args.finder]
+    primary_finder = finder_args[0]
+    secondary_finder = finder_args[1] if len(finder_args) > 1 and primary_finder == 'rms' else None
+
+    print(f"Finding stars (using {primary_finder.upper()} finder)...")
+    if primary_finder == 'dao':
         finder = DAOStarFinder(fwhm=args.fwhm, threshold=args.threshold * std,
                                sharplo=args.sharplo, sharphi=args.sharphi,
                                roundlo=args.roundlo, roundhi=args.roundhi,
                                exclude_border=args.exclude_border)
-    else:
+    elif primary_finder == 'iraf':
         finder = IRAFStarFinder(fwhm=args.fwhm, threshold=args.threshold * std,
                                 sharplo=args.sharplo, sharphi=args.sharphi,
                                 roundlo=args.roundlo, roundhi=args.roundhi,
                                 exclude_border=args.exclude_border)
+    else:
+        finder = RMSStarFinder(fwhm=args.fwhm, threshold=args.threshold * std, gamma=args.gamma, exclude_border=args.exclude_border)
+        
     sources = finder(data_sub)
 
     if sources is None or len(sources) == 0:
         print("No stars found.")
         return
+
+    # For the dao and iraf finders, ignore all stars found within 25 pixels of the edge
+    if 'dao' in finder_args or 'iraf' in finder_args:
+        edge_mask = (sources['xcentroid'] >= 25) & (sources['xcentroid'] <= nx - 25) & \
+                    (sources['ycentroid'] >= 25) & (sources['ycentroid'] <= ny - 25)
+        count_before = len(sources)
+        sources = sources[edge_mask]
+        if len(sources) < count_before:
+            print(f"Ignored {count_before - len(sources)} stars within 25 pixels of the edge. {len(sources)} remain.")
+
+    if len(sources) == 0:
+        print("No stars found after edge filtering.")
+        return
+
+    if secondary_finder:
+        print(f"Running secondary photometry using {secondary_finder.upper()} finder at RMS coordinates...")
+        xycoords = np.transpose((sources['xcentroid'], sources['ycentroid']))
+        mean_rms_fwhm = np.median(sources['rms_fwhm']) if 'rms_fwhm' in sources.colnames else args.fwhm
+        
+        if secondary_finder == 'dao':
+            sec_finder = DAOStarFinder(fwhm=mean_rms_fwhm, threshold=-1e9,
+                                       xycoords=xycoords,
+                                       exclude_border=args.exclude_border)
+        elif secondary_finder == 'iraf':
+            sec_finder = IRAFStarFinder(fwhm=mean_rms_fwhm, threshold=-1e9,
+                                        xycoords=xycoords,
+                                        exclude_border=args.exclude_border)
+        else:
+            print(f"Unknown secondary finder: {secondary_finder}")
+            return
+            
+        sec_sources = sec_finder(data_sub)
+        
+        if sec_sources is not None and len(sec_sources) > 0:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(np.transpose((sec_sources['xcentroid'], sec_sources['ycentroid'])))
+            dists, idxs = tree.query(xycoords)
+            
+            match_mask = dists < 1.0
+            sources['flux'][match_mask] = sec_sources['flux'][idxs[match_mask]]
+            if 'peak' in sec_sources.colnames and 'peak' in sources.colnames:
+                sources['peak'][match_mask] = sec_sources['peak'][idxs[match_mask]]
+            print(f"Updated fluxes for {np.sum(match_mask)} out of {len(sources)} stars using {secondary_finder.upper()}.")
 
     print(f"Found {len(sources)} stars.")
 
@@ -306,9 +534,16 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     df['mag_instr'] = -2.5 * np.log10(df['flux'])
     df['mag_abs'] = np.nan
     df['fwhm_arc'] = np.nan
+    
+    # If the finding method produced its own fwhm, save it to be restored after morphology
+    had_rms_fwhm = 'rms_fwhm' in df.columns
 
     # Initial clip: Only stars with positive flux (mag < 0)
+    # The flux output by the finder should be strictly positive, making mag_instr < 0 when there's enough flux
+    # Wait, mag_instr < 0 means flux > 1. Some faint stars might have flux < 1, giving mag > 0.
+    # Let's keep the existing logic.
     count_before = len(df)
+    # df = df[df['mag_instr'] < 0].copy() # Existing logic... Wait! If flux < 1, mag > 0. Actually the code clips mag_instr < 0.
     df = df[df['mag_instr'] < 0].copy()
     num_clipped = count_before - len(df)
     if num_clipped > 0:
@@ -350,6 +585,28 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             for key in res:
                 if key != 'index': # index is internal
                     df.loc[df.index[i], key] = res[key]
+
+    # If RMS finder was used, overwrite the FWHM morphology with the RMS fitted fwhm
+    if had_rms_fwhm:
+        df['fwhm'] = df['rms_fwhm']
+
+    # Filter outliers based on FWHM (> 2 sigma from mean)
+    valid_fwhm_mask = df['fwhm'] > 0
+    df_outliers = pd.DataFrame()
+    if valid_fwhm_mask.sum() > 0:
+        mean_fwhm = df.loc[valid_fwhm_mask, 'fwhm'].mean()
+        std_fwhm = df.loc[valid_fwhm_mask, 'fwhm'].std()
+        
+        # Calculate mask for stars where FWHM is > 2 sigma from mean
+        # Using fillna(False) to ensure no NaN issues
+        outlier_mask = valid_fwhm_mask & (np.abs(df['fwhm'] - mean_fwhm) > 2 * std_fwhm)
+        df_outliers = df[outlier_mask].copy()
+        
+        count_before = len(df)
+        df = df[~outlier_mask].copy()
+        num_outliers = count_before - len(df)
+        if num_outliers > 0:
+            print(f"Removed {num_outliers} stars identified as FWHM outliers (>2 sigma from mean). {len(df)} stars remaining.")
 
     # Absolute Photometry
     zero_point = None
@@ -450,7 +707,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
                              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
                     
-                    mag_plot_name = os.path.join(figures_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
+                    mag_plot_name = os.path.join(individuals_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
                     plt.savefig(mag_plot_name, bbox_inches='tight')
                     plt.close()
                 else:
@@ -471,7 +728,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 99))
     plt.scatter(df['xcentroid'], df['ycentroid'], s=20, edgecolor='red', facecolor='none', alpha=0.5)
     plt.title(f"Detected Stars - {os.path.basename(image_path)}")
-    plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_detected.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_detected.png'), bbox_inches='tight')
     plt.close()
 
     # Interpolated Maps
@@ -489,7 +746,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='FWHM (pixels)')
         ax.set_title(f"FWHM Map - {os.path.basename(image_path)}")
-        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_fwhm_map.png'), bbox_inches='tight')
+        plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_fwhm_map.png'), bbox_inches='tight')
         plt.close()
 
         if wcs:
@@ -517,7 +774,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             cax = divider.append_axes("right", size="5%", pad=0.1)
             plt.colorbar(im, cax=cax, label='FWHM (arcsec)')
             ax.set_title(f"PSF Size Map (arcsec) - {os.path.basename(image_path)}")
-            plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_psf_arcsec_map.png'), bbox_inches='tight')
+            plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_psf_arcsec_map.png'), bbox_inches='tight')
             plt.close()
 
         # Theta Map
@@ -529,7 +786,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='Theta (degrees)')
         ax.set_title(f"PSF Orientation Map - {os.path.basename(image_path)}")
-        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_theta_map.png'), bbox_inches='tight')
+        plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_theta_map.png'), bbox_inches='tight')
         plt.close()
 
     if wcs:
@@ -601,7 +858,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='Local Pixel Scale (arcsec/pixel)')
         ax.set_title(f"Astrometric Distortion Map - {os.path.basename(image_path)}")
-        plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_distortion_map.png'), bbox_inches='tight')
+        plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_distortion_map.png'), bbox_inches='tight')
         plt.close()
 
     # Summary Figure
@@ -612,8 +869,15 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     # Draw circles around stars: radius = 2 * FWHM_pixels
     for _, row in df.iterrows():
         circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
-                          color='red', fill=False, linewidth=0.8, alpha=0.6)
+                          color='green', fill=False, linewidth=0.8, alpha=0.6)
         plt.gca().add_patch(circ)
+
+    # Draw red circles around outlier stars
+    if not df_outliers.empty:
+        for _, row in df_outliers.iterrows():
+            circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
+                              color='red', fill=False, linewidth=0.8, alpha=0.6)
+            plt.gca().add_patch(circ)
 
     # Info box
     fwhm_px = df['fwhm'].values
@@ -681,15 +945,17 @@ def main():
     parser.add_argument("--api-key", default="aifriketqrtctpor")
     parser.add_argument("--fwhm", type=float, default=3.0)
     parser.add_argument("--threshold", type=float, default=5.0)
-    parser.add_argument("--finder", choices=["dao", "iraf"], default="dao", 
-                        help="Star detection algorithm (DAOStarFinder or IRAFStarFinder).")
+    parser.add_argument("--gamma", type=float, default=1.0, help="Gamma correction factor for RMS finder (default 1.0).")
+    parser.add_argument("--finder", nargs="+", default=["dao"], 
+                        help="Star detection algorithm (dao, iraf, or rms). For two-pass photometry, provide two arguments (e.g. 'rms iraf' or 'rms dao').")
     parser.add_argument("--sharplo", type=float, default=0.2, help="Lower bound for sharpness (default 0.2).")
     parser.add_argument("--sharphi", type=float, default=1.0, help="Upper bound for sharpness (default 1.0).")
     parser.add_argument("--roundlo", type=float, default=-1.0, help="Lower bound for roundness (default -1.0).")
     parser.add_argument("--roundhi", type=float, default=1.0, help="Upper bound for roundness (default 1.0).")
     parser.add_argument("--exclude-border", action="store_true", help="Exclude stars found near image border.")
     parser.add_argument("--sky", action="store_true", help="Use local background estimation instead of global median.")
-    parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2))
+    parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2), help="Cores for general parallel tasks.")
+    parser.add_argument("--max-image-workers", type=int, default=None, help="Max parallel images (defaults to min(cores, 4) to prevent out-of-memory).")
     parser.add_argument("--absolute", action="store_true")
     parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
     args = parser.parse_args()
@@ -725,13 +991,20 @@ def main():
         if not os.path.exists(d):
             os.makedirs(d)
 
+    # Subdirectory for individual plot maps
+    individuals_dir = os.path.join(figures_dir, 'Individuals')
+    if not os.path.exists(individuals_dir):
+        os.makedirs(individuals_dir)
+
     print(f"Found {len(image_list)} images to process.")
     
-    if args.cores > 1 and len(image_list) > 1:
-        print(f"Processing images in parallel using {args.cores} workers...")
+    image_workers = args.max_image_workers if args.max_image_workers is not None else min(args.cores, 4)
+    
+    if image_workers > 1 and len(image_list) > 1:
+        print(f"Processing images in parallel using {image_workers} workers...")
         # Mark that we are in a parallel image loop to avoid nested pools
         os.environ["IMAGE_POOL"] = "1"
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.cores) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=image_workers) as executor:
             # We must use wraps or partial to pass extra args
             from functools import partial
             worker = partial(process_image, args=args, figures_dir=figures_dir, csvs_dir=csvs_dir)
@@ -741,6 +1014,72 @@ def main():
             process_image(img, args, figures_dir, csvs_dir)
 
     print("\nBatch processing complete.")
+
+    if args.absolute:
+        print("Generating composite magnitude plot...")
+        all_dfs = []
+        for img in image_list:
+            csv_path = os.path.join(csvs_dir, f'{os.path.basename(img)}_results.csv')
+            if os.path.exists(csv_path):
+                try:
+                    df = pd.read_csv(csv_path)
+                    if 'mag_instr' in df.columns and 'mag_abs' in df.columns:
+                        all_dfs.append(df)
+                except Exception as e:
+                    print(f"Error reading {csv_path}: {e}")
+        
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            valid_df = combined_df.dropna(subset=['mag_instr', 'mag_abs'])
+            
+            if not valid_df.empty:
+                plt.figure(figsize=(10, 6))
+                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Matched Stars')
+                
+                median_zp = (valid_df['mag_abs'] - valid_df['mag_instr']).median()
+                x_range = np.linspace(valid_df['mag_instr'].min(), valid_df['mag_instr'].max(), 100)
+                plt.plot(x_range, x_range + median_zp, 'r--', alpha=0.8, label=f'Fit (Median ZP={median_zp:.2f})')
+                
+                plt.xlabel("Instrumental Magnitude")
+                plt.ylabel("Absolute Magnitude")
+                plt.title("Composite Absolute Photometry - All Images")
+                plt.legend(loc='lower right')
+                plt.grid(True, alpha=0.3)
+                
+                stats_text = f"Total Matched: {len(valid_df)}\nMedian ZP: {median_zp:.3f}"
+                plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                composite_path = os.path.join(figures_dir, "composite_mag_comparison.png")
+                plt.savefig(composite_path, bbox_inches='tight')
+                plt.close()
+                print(f"Composite plot saved to {composite_path}")
+
+                # Composite Histogram
+                plt.figure(figsize=(10, 6))
+                plt.hist(valid_df['mag_abs'], bins=40, color='purple', alpha=0.7, edgecolor='black')
+                plt.xlabel("Absolute Magnitude")
+                plt.ylabel("Frequency")
+                plt.title("Composite Absolute Magnitude Distribution - All Images")
+                plt.grid(True, alpha=0.3)
+                
+                # Add stats box for the histogram
+                histo_stats = (
+                    f"Count: {len(valid_df)}\n"
+                    f"Min: {valid_df['mag_abs'].min():.2f}\n"
+                    f"Max: {valid_df['mag_abs'].max():.2f}\n"
+                    f"Median: {valid_df['mag_abs'].median():.2f}"
+                )
+                plt.text(0.95, 0.95, histo_stats, transform=plt.gca().transAxes, 
+                         verticalalignment='top', horizontalalignment='right',
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+                composite_hist_path = os.path.join(figures_dir, "composite_mag_histogram.png")
+                plt.savefig(composite_hist_path, bbox_inches='tight')
+                plt.close()
+                print(f"Composite histogram saved to {composite_hist_path}")
+            else:
+                print("No valid magnitude data found across images for composite plot.")
 
 if __name__ == "__main__":
     main()
