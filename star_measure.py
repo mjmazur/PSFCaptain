@@ -525,7 +525,19 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     wcs = None
     if args.astrometry:
         print("Attempting to solve astrometry...")
-        wcs = solve_astrometry(image_path, sources, api_key=args.api_key)
+        ext_check = os.path.splitext(image_path)[1].lower()
+        if ext_check not in ['.fits', '.fit']:
+            temp_fits = os.path.join(individuals_dir, f'temp_astrometry_{os.path.basename(image_path)}.fits')
+            from astropy.io import fits
+            fits.writeto(temp_fits, data, overwrite=True)
+            wcs = solve_astrometry(temp_fits, sources, api_key=args.api_key)
+            try:
+                os.remove(temp_fits)
+            except OSError:
+                pass
+        else:
+            wcs = solve_astrometry(image_path, sources, api_key=args.api_key)
+            
         if not wcs:
             print("!!! Astrometry failed. Some features will be limited.")
 
@@ -652,31 +664,35 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     matched_df = df[matches_mask].copy()
                     matched_cat_mag = cat_mag[idx[matches_mask]]
                     
-                    # Selective RANSAC Fitting: Use stars with mag_instr < -7 
-                    # (Restoring all stars for the plot/CSV, but only using bright ones for the fit)
-                    fit_mask = matched_df['mag_instr'] < -7
+                    # Selective RANSAC Fitting: Use stars with mag_instr < 0
+                    fit_mask = matched_df['mag_instr'] < 0
                     
                     if fit_mask.sum() > 5:
-                        print(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < -7...")
+                        print(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < 0...")
                         x_fit = matched_df[fit_mask]['mag_instr'].values.reshape(-1, 1)
                         y_fit = np.asarray(matched_cat_mag[fit_mask])
                     else:
                         if fit_mask.sum() > 0:
-                            print(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < -7. Using all {len(matched_df)} matched stars for fit.")
+                            print(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < 0. Using all {len(matched_df)} matched stars for fit.")
                         x_fit = matched_df['mag_instr'].values.reshape(-1, 1)
                         y_fit = np.asarray(matched_cat_mag)
 
-                    from sklearn.linear_model import RANSACRegressor
-                    ransac = RANSACRegressor()
-                    ransac.fit(x_fit, y_fit)
-                    inlier_mask = ransac.inlier_mask_
-                    
-                    # The offset (zero point) is the intercept if we assume slope=1
-                    # Actually, we want phot_cat = mag_instr + ZP, so ZP = phot_cat - mag_instr
-                    # RANSAC fits y = slope*x + intercept. Here y is cat_mag, x is mag_instr.
-                    # We expect slope close to 1.
-                    zero_point = np.median(y_fit[inlier_mask] - x_fit[inlier_mask].flatten())
-                    print(f"RANSAC Zero-Point ({mag_label}): {zero_point:.3f} mag (based on {inlier_mask.sum()} inliers)")
+                    if len(x_fit) >= 3:
+                        from sklearn.linear_model import RANSACRegressor
+                        ransac = RANSACRegressor()
+                        ransac.fit(x_fit, y_fit)
+                        inlier_mask = ransac.inlier_mask_
+                        
+                        # The offset (zero point) is the intercept if we assume slope=1
+                        # Actually, we want phot_cat = mag_instr + ZP, so ZP = phot_cat - mag_instr
+                        # RANSAC fits y = slope*x + intercept. Here y is cat_mag, x is mag_instr.
+                        # We expect slope close to 1.
+                        zero_point = np.median(y_fit[inlier_mask] - x_fit[inlier_mask].flatten())
+                        print(f"RANSAC Zero-Point ({mag_label}): {zero_point:.3f} mag (based on {inlier_mask.sum()} inliers)")
+                    else:
+                        print(f"Warning: Only {len(x_fit)} matched stars available. Skipping RANSAC and using strict median offset.")
+                        zero_point = np.median(y_fit - x_fit.flatten())
+                        print(f"Median Zero-Point ({mag_label}): {zero_point:.3f} mag")
                     
                     df['mag_abs'] = df['mag_instr'] + zero_point
                     
@@ -745,10 +761,15 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         grid_x, grid_y = np.mgrid[0:nx:100j, 0:ny:100j]
         
         # FWHM Map
+        mean_fwhm = np.nanmean(df['fwhm'])
+        std_fwhm = np.nanstd(df['fwhm'])
+        fwhm_vmin = mean_fwhm - (2 * std_fwhm)
+        fwhm_vmax = mean_fwhm + (2 * std_fwhm)
+        
         plt.figure(figsize=(10, 8))
         grid_fwhm = griddata((df['xcentroid'], df['ycentroid']), df['fwhm'], (grid_x, grid_y), method='cubic')
         ax = plt.gca()
-        im = ax.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        im = ax.imshow(grid_fwhm.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis', vmin=fwhm_vmin, vmax=fwhm_vmax)
         divider = make_axes_locatable(ax)
         cax = divider.append_axes("right", size="5%", pad=0.1)
         plt.colorbar(im, cax=cax, label='FWHM (pixels)')
@@ -773,10 +794,15 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             
             df['fwhm_arc'] = df['fwhm'] * local_scales
             
+            mean_arc = np.nanmean(df['fwhm_arc'])
+            std_arc = np.nanstd(df['fwhm_arc'])
+            arc_vmin = mean_arc - (2 * std_arc)
+            arc_vmax = mean_arc + (2 * std_arc)
+            
             plt.figure(figsize=(10, 8))
             grid_fwhm_arc = griddata((df['xcentroid'], df['ycentroid']), df['fwhm_arc'], (grid_x, grid_y), method='cubic')
             ax = plt.gca()
-            im = ax.imshow(grid_fwhm_arc.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+            im = ax.imshow(grid_fwhm_arc.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis', vmin=arc_vmin, vmax=arc_vmax)
             divider = make_axes_locatable(ax)
             cax = divider.append_axes("right", size="5%", pad=0.1)
             plt.colorbar(im, cax=cax, label='FWHM (arcsec)')
