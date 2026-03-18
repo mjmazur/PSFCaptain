@@ -680,36 +680,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     
                     df['mag_abs'] = df['mag_instr'] + zero_point
                     
-                    # Magnitude Comparison Plot
-                    plt.figure(figsize=(10, 6))
-                    # Plot everything first as context
-                    plt.scatter(matched_df['mag_instr'], matched_cat_mag, c='orange', s=10, alpha=0.5, label='Other Matched Stars')
-                    
-                    # Highlight the RANSAC set
-                    if fit_mask.any():
-                        x_fit_all = matched_df[fit_mask]['mag_instr']
-                        y_fit_all = matched_cat_mag[fit_mask]
-                        plt.scatter(x_fit_all[inlier_mask], y_fit_all[inlier_mask], c='blue', s=30, label='RANSAC Inliers (< -7)')
-                        plt.scatter(x_fit_all[~inlier_mask], y_fit_all[~inlier_mask], c='gray', marker='x', s=30, label='RANSAC Outliers')
-                    
-                    # Plot the theoretical fit line (slope=1)
-                    x_range = np.linspace(df['mag_instr'].min(), df['mag_instr'].max(), 100)
-                    plt.plot(x_range, x_range + zero_point, 'r--', alpha=0.8, label=f'Fit (ZP={zero_point:.2f})')
-                    
-                    plt.xlabel("Instrumental Magnitude")
-                    plt.ylabel(f"Catalog Magnitude ({mag_label})")
-                    plt.title(f"Absolute Photometry Calibration - {os.path.basename(image_path)}")
-                    plt.legend(loc='lower right')
-                    plt.grid(True, alpha=0.3)
-                    
-                    # Add stats text
-                    stats_text = f"Matched: {len(matched_df)}\nInliers: {inlier_mask.sum()}\nZP: {zero_point:.3f}"
-                    plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
-                             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
-                    
-                    mag_plot_name = os.path.join(individuals_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
-                    plt.savefig(mag_plot_name, bbox_inches='tight')
-                    plt.close()
+                    # We will generate the mag_comparison plot later from the saved CSV
                 else:
                     print(f"No Gaia stars matched within {match_limit_arcsec:.2f} arcseconds.")
             else:
@@ -719,6 +690,42 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     results_csv = os.path.join(csvs_dir, f'{os.path.basename(image_path)}_results.csv')
     df.to_csv(results_csv, index=False)
     print(f"Results saved to {results_csv}")
+
+    # Generate Catalog Plots from the generic CSV ensuring we capture the explicit population
+    if args.absolute and os.path.exists(results_csv):
+        csv_df = pd.read_csv(results_csv)
+        if 'mag_abs' in csv_df.columns and 'mag_instr' in csv_df.columns:
+            valid_mags = csv_df.dropna(subset=['mag_abs', 'mag_instr'])
+            if not valid_mags.empty:
+                plt.figure(figsize=(10, 6))
+                plt.scatter(valid_mags['mag_instr'], valid_mags['mag_abs'], c='blue', s=10, alpha=0.5, label='All Extracted Stars')
+                
+                # Plot the theoretical fit line
+                x_range = np.linspace(valid_mags['mag_instr'].min(), valid_mags['mag_instr'].max(), 100)
+                # Since mag_abs = mag_instr + ZP, plot x_range vs x_range + ZP. ZP isn't easily grabbed here, but we can compute it
+                zp_calc = valid_mags['mag_abs'].iloc[0] - valid_mags['mag_instr'].iloc[0]
+                plt.plot(x_range, x_range + zp_calc, 'r--', alpha=0.8, label=f'Fit (ZP={zp_calc:.2f})')
+                
+                plt.xlabel("Instrumental Magnitude")
+                plt.ylabel("Absolute Magnitude")
+                plt.title(f"Absolute Photometry Overview - {os.path.basename(image_path)}")
+                plt.legend(loc='lower right')
+                plt.grid(True, alpha=0.3)
+                
+                mag_plot_name = os.path.join(individuals_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
+                plt.savefig(mag_plot_name, bbox_inches='tight')
+                plt.close()
+                
+                # Also generate the abs_mag_hist plot since it's in the README
+                plt.figure(figsize=(10, 6))
+                plt.hist(valid_mags['mag_abs'], bins=30, color='purple', alpha=0.7, edgecolor='black')
+                plt.xlabel("Absolute Magnitude")
+                plt.ylabel("Count")
+                plt.title(f"Absolute Magnitude Distribution - {os.path.basename(image_path)}")
+                plt.grid(axis='y', alpha=0.3)
+                hist_plot_name = os.path.join(individuals_dir, f'{os.path.basename(image_path)}_abs_mag_hist.png')
+                plt.savefig(hist_plot_name, bbox_inches='tight')
+                plt.close()
 
     # Visualizations
     print("Generating figures...")
