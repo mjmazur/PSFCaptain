@@ -25,6 +25,13 @@ import concurrent.futures
 import multiprocessing
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+def safe_pixel_to_world(wcs_obj, x, y):
+    """Safely handles WCS pixel_to_world conversions which may return lists of coords for multi-axis FITS."""
+    coord = wcs_obj.pixel_to_world(x, y)
+    if isinstance(coord, (list, tuple)):
+        return coord[0]
+    return coord
+
 def twoDGaussian(params, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
     """ Defines a 2D Gaussian distribution. """
     x, y, saturation = params
@@ -57,7 +64,7 @@ def gamma_correction(intensity, gamma, bp=0, wp=255):
         return bp
 
 class RMSStarFinder:
-    def __init__(self, fwhm, threshold, gamma=1.0, neighborhood_size=10, segment_radius=15, roundness_threshold=0.1, max_feature_ratio=2.0, exclude_border=False):
+    def __init__(self, fwhm, threshold, gamma=1.0, neighborhood_size=10, segment_radius=15, roundness_threshold=0.1, max_feature_ratio=2.0, exclude_border=False, xycoords=None):
         self.fwhm = fwhm
         self.threshold = threshold
         self.gamma = gamma
@@ -66,6 +73,7 @@ class RMSStarFinder:
         self.roundness_threshold = roundness_threshold
         self.max_feature_ratio = max_feature_ratio
         self.exclude_border = exclude_border
+        self.xycoords = xycoords
 
     def __call__(self, data):
         import scipy.ndimage as ndimage
@@ -79,43 +87,51 @@ class RMSStarFinder:
         # Apply a mean filter to the image to reduce noise
         data_filtered = ndimage.convolve(data.astype(np.float32), weights=np.full((2, 2), 1.0/4))
         
-        # Locate local maxima on the image
-        data_max = ndimage.maximum_filter(data_filtered, self.neighborhood_size)
-        maxima = (data_filtered == data_max)
-        data_min = ndimage.minimum_filter(data_filtered, self.neighborhood_size)
-        diff = ((data_max - data_min) > self.threshold)
-        maxima[diff == 0] = 0
-        
-        if self.exclude_border:
-            border = int(self.fwhm * 2)
-            border_mask = np.ones_like(maxima)*255
-            border_mask[:border,:] = 0
-            border_mask[-border:,:] = 0
-            border_mask[:,:border] = 0
-            border_mask[:,-border:] = 0
-            maxima[border_mask == 0] = 0
+        if self.xycoords is not None:
+            if len(self.xycoords) == 0:
+                return None
+            x = self.xycoords[:, 0]
+            y = self.xycoords[:, 1]
+        else:
+            # Locate local maxima on the image
+            data_max = ndimage.maximum_filter(data_filtered, self.neighborhood_size)
+            maxima = (data_filtered == data_max)
+            data_min = ndimage.minimum_filter(data_filtered, self.neighborhood_size)
+            diff = ((data_max - data_min) > self.threshold)
+            maxima[diff == 0] = 0
             
-        # Find and label the maxima
-        labeled, num_objects = ndimage.label(maxima)
-        if num_objects == 0:
-            return None
+            if self.exclude_border:
+                border = int(self.fwhm * 2)
+                border_mask = np.ones_like(maxima)*255
+                border_mask[:border,:] = 0
+                border_mask[-border:,:] = 0
+                border_mask[:,:border] = 0
+                border_mask[:,-border:] = 0
+                maxima[border_mask == 0] = 0
+                
+            # Find and label the maxima
+            labeled, num_objects = ndimage.label(maxima)
+            if num_objects == 0:
+                return None
+                
+            # Find centres of mass of each labeled objects
+            xy = np.array(ndimage.center_of_mass(data_filtered, labeled, range(1, num_objects+1)))
             
-        # Find centres of mass of each labeled objects
-        xy = np.array(ndimage.center_of_mass(data_filtered, labeled, range(1, num_objects+1)))
-        
-        if len(xy) == 0:
-            return None
-            
-        # Unpack star coordinates
-        y, x = np.hsplit(xy, 2)
-        y = y.flatten()
-        x = x.flatten()
+            if len(xy) == 0:
+                return None
+                
+            # Unpack star coordinates
+            y, x = np.hsplit(xy, 2)
+            y = y.flatten()
+            x = x.flatten()
         
         x_fitted = []
         y_fitted = []
         amplitude_fitted = []
         intensity_fitted = []
         fwhm_fitted = []
+        elongation_fitted = []
+        theta_fitted = []
         
         segment_radius = self.segment_radius
         ny, nx = data.shape
@@ -183,12 +199,16 @@ class RMSStarFinder:
                 
             sigma_fitted = np.sqrt(sigma_x**2 + sigma_y**2)
             fwhm_val = 2.355 * sigma_fitted
+            elongation_val = max(abs(sigma_x), abs(sigma_y)) / max(min(abs(sigma_x), abs(sigma_y)), 1e-6)
+            theta_deg = np.degrees(theta) % 360
             
             x_fitted.append(x_min + xo)
             y_fitted.append(y_min + yo)
             amplitude_fitted.append(amplitude)
             intensity_fitted.append(intensity)
             fwhm_fitted.append(fwhm_val)
+            elongation_fitted.append(elongation_val)
+            theta_fitted.append(theta_deg)
             
         if not x_fitted:
             return None
@@ -200,6 +220,8 @@ class RMSStarFinder:
         t['flux'] = intensity_fitted
         t['peak'] = amplitude_fitted
         t['rms_fwhm'] = fwhm_fitted
+        t['rms_elongation'] = elongation_fitted
+        t['rms_theta'] = theta_fitted
         return t
 
 def process_single_star(i, x, y, mag_instr, cutout, std, wcs=None):
@@ -212,13 +234,13 @@ def process_single_star(i, x, y, mag_instr, cutout, std, wcs=None):
         
         if wcs:
             try:
-                sky_coord = wcs.pixel_to_world(x, y)
+                sky_coord = safe_pixel_to_world(wcs, x, y)
                 ra, dec = float(sky_coord.ra.deg), float(sky_coord.dec.deg)
                 
                 # Sample local pixel scale
                 sky1 = sky_coord
-                sky2 = wcs.pixel_to_world(x + 1, y)
-                sky3 = wcs.pixel_to_world(x, y + 1)
+                sky2 = safe_pixel_to_world(wcs, x + 1, y)
+                sky3 = safe_pixel_to_world(wcs, x, y + 1)
                 local_scale = float(np.sqrt(sky1.separation(sky2).arcsec * sky1.separation(sky3).arcsec))
             except:
                 pass
@@ -511,6 +533,10 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             sec_finder = IRAFStarFinder(fwhm=mean_rms_fwhm, threshold=-1e9,
                                         xycoords=xycoords,
                                         exclude_border=args.exclude_border)
+        elif secondary_finder == 'rms':
+            sec_finder = RMSStarFinder(fwhm=mean_rms_fwhm, threshold=-1e9, gamma=args.gamma,
+                                       xycoords=xycoords,
+                                       exclude_border=args.exclude_border)
         else:
             print(f"Unknown secondary finder: {secondary_finder}")
             return
@@ -526,7 +552,23 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             sources['flux'][match_mask] = sec_sources['flux'][idxs[match_mask]]
             if 'peak' in sec_sources.colnames and 'peak' in sources.colnames:
                 sources['peak'][match_mask] = sec_sources['peak'][idxs[match_mask]]
-            print(f"Updated fluxes for {np.sum(match_mask)} out of {len(sources)} stars using {secondary_finder.upper()}.")
+                
+            if 'rms_fwhm' in sec_sources.colnames:
+                if 'rms_fwhm' not in sources.colnames:
+                    sources['rms_fwhm'] = np.nan
+                sources['rms_fwhm'][match_mask] = sec_sources['rms_fwhm'][idxs[match_mask]]
+                
+            if 'rms_elongation' in sec_sources.colnames:
+                if 'rms_elongation' not in sources.colnames:
+                    sources['rms_elongation'] = np.nan
+                sources['rms_elongation'][match_mask] = sec_sources['rms_elongation'][idxs[match_mask]]
+                
+            if 'rms_theta' in sec_sources.colnames:
+                if 'rms_theta' not in sources.colnames:
+                    sources['rms_theta'] = np.nan
+                sources['rms_theta'][match_mask] = sec_sources['rms_theta'][idxs[match_mask]]
+                
+            print(f"Updated fluxes and morphology properties for {np.sum(match_mask)} out of {len(sources)} stars using {secondary_finder.upper()}.")
 
     print(f"Found {len(sources)} stars.")
 
@@ -607,9 +649,23 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                 if key != 'index': # index is internal
                     df.loc[df.index[i], key] = res[key]
 
-    # If RMS finder was used, overwrite the FWHM morphology with the RMS fitted fwhm
+    # Check specifically for RMS morphology parameters
+    had_rms_fwhm = 'rms_fwhm' in df.columns
+    had_rms_elongation = 'rms_elongation' in df.columns
+    had_rms_theta = 'rms_theta' in df.columns
+
+    # If RMS finder was used, overwrite the respective array blocks mapped dynamically locally
     if had_rms_fwhm:
-        df['fwhm'] = df['rms_fwhm']
+        mask = ~df['rms_fwhm'].isna()
+        df.loc[mask, 'fwhm'] = df.loc[mask, 'rms_fwhm']
+        
+    if had_rms_elongation:
+        mask = ~df['rms_elongation'].isna()
+        df.loc[mask, 'elongation'] = df.loc[mask, 'rms_elongation']
+        
+    if had_rms_theta:
+        mask = ~df['rms_theta'].isna()
+        df.loc[mask, 'theta'] = df.loc[mask, 'rms_theta']
 
     # Filter outliers based on FWHM (> 2 sigma from mean)
     valid_fwhm_mask = df['fwhm'] > 0
@@ -636,10 +692,10 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             print("!!! Absolute photometry skipped: Astrometry must be solved first. Use --astrometry.")
         else:
             from astropy.coordinates import SkyCoord
-            center_sky = wcs.pixel_to_world(df['xcentroid'].mean(), df['ycentroid'].mean())
+            center_sky = safe_pixel_to_world(wcs, df['xcentroid'].mean(), df['ycentroid'].mean())
             # Estimate radius needed to cover the image
-            p0 = wcs.pixel_to_world(0, 0)
-            p1 = wcs.pixel_to_world(nx, ny)
+            p0 = safe_pixel_to_world(wcs, 0, 0)
+            p1 = safe_pixel_to_world(wcs, nx, ny)
             radius = p0.separation(p1).deg / 2.0 * 1.2
             
             print(f"Performing absolute photometry via {args.catalog.upper()} catalog...")
@@ -658,7 +714,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                     mag_label = "Tycho-2 VT"
 
                 catalog_coords = SkyCoord(ra=cat_ra, dec=cat_dec, unit=u.deg)
-                star_coords = wcs.pixel_to_world(df['xcentroid'], df['ycentroid'])
+                star_coords = safe_pixel_to_world(wcs, df['xcentroid'], df['ycentroid'])
                 
                 # Match
                 # We use a 5 pixel match limit. Calculate that in arcsec based on image scale
@@ -727,18 +783,19 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             if not valid_mags.empty:
                 plt.figure(figsize=(10, 6))
                 
+                plt.scatter(valid_mags['mag_instr'], valid_mags['mag_abs'], c='blue', s=10, alpha=0.5, label='All Extracted Stars')
+                
                 if 'catalog_mag' in csv_df.columns:
                     matched_stars = csv_df.dropna(subset=['catalog_mag', 'mag_instr'])
                 else:
                     matched_stars = pd.DataFrame()
                     
                 if not matched_stars.empty:
-                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], c='orange', s=10, alpha=0.5, label='Catalog Matched Stars')
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], c='orange', s=10, alpha=0.9, label='Catalog Matched Stars')
                     residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
                     fit_error = residuals.std()
                     match_count = len(matched_stars)
                 else:
-                    plt.scatter(valid_mags['mag_instr'], valid_mags['mag_abs'], c='blue', s=10, alpha=0.5, label='All Extracted Stars')
                     fit_error = np.nan
                     match_count = 0
                 
@@ -1112,18 +1169,19 @@ def main():
             if not valid_df.empty:
                 plt.figure(figsize=(10, 6))
                 
+                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Measured Stars')
+                
                 if 'catalog_mag' in combined_df.columns:
                     matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
                 else:
                     matched_stars = pd.DataFrame()
                     
                 if not matched_stars.empty:
-                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.1, s=5, c='orange', label='Catalog Matched Stars')
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.3, s=5, c='orange', label='Catalog Matched Stars')
                     residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
                     fit_error = residuals.std()
                     match_count = len(matched_stars)
                 else:
-                    plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Measured Stars')
                     fit_error = np.nan
                     match_count = 0
                 
