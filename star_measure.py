@@ -274,11 +274,20 @@ def load_image(file_path):
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ['.fits', '.fit']:
         with fits.open(file_path) as hdul:
-            data = hdul[0].data
+            data = None
+            header = None
+            for hdu in hdul:
+                if hdu.data is not None and getattr(hdu.data, 'size', 0) > 0:
+                    data = hdu.data
+                    header = hdu.header
+                    break
+            
+            if data is None:
+                raise ValueError(f"No valid image data found in FITS: {file_path}")
+            
             # FITS data can be 3D (e.g., [1, Y, X]), take the first slice if so
             if data.ndim == 3:
                 data = data[0]
-            header = hdul[0].header
             return data.astype(float), header
     elif ext in ['.png', '.bmp']:
         img = Image.open(file_path).convert('L')
