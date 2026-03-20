@@ -660,9 +660,12 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                 idx, d2d, _ = star_coords.match_to_catalog_sky(catalog_coords)
                 matches_mask = d2d < match_limit_arcsec * u.arcsec
                 
+                df['catalog_mag'] = np.nan
+                
                 if matches_mask.any():
                     matched_df = df[matches_mask].copy()
                     matched_cat_mag = cat_mag[idx[matches_mask]]
+                    df.loc[matches_mask, 'catalog_mag'] = np.asarray(matched_cat_mag)
                     
                     # Selective RANSAC Fitting: Use stars with mag_instr < 0
                     fit_mask = matched_df['mag_instr'] < 0
@@ -714,19 +717,38 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             valid_mags = csv_df.dropna(subset=['mag_abs', 'mag_instr'])
             if not valid_mags.empty:
                 plt.figure(figsize=(10, 6))
-                plt.scatter(valid_mags['mag_instr'], valid_mags['mag_abs'], c='blue', s=10, alpha=0.5, label='All Extracted Stars')
+                
+                if 'catalog_mag' in csv_df.columns:
+                    matched_stars = csv_df.dropna(subset=['catalog_mag', 'mag_instr'])
+                else:
+                    matched_stars = pd.DataFrame()
+                    
+                if not matched_stars.empty:
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], c='orange', s=10, alpha=0.5, label='Catalog Matched Stars')
+                    residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
+                    fit_error = residuals.std()
+                    match_count = len(matched_stars)
+                else:
+                    plt.scatter(valid_mags['mag_instr'], valid_mags['mag_abs'], c='blue', s=10, alpha=0.5, label='All Extracted Stars')
+                    fit_error = np.nan
+                    match_count = 0
                 
                 # Plot the theoretical fit line
                 x_range = np.linspace(valid_mags['mag_instr'].min(), valid_mags['mag_instr'].max(), 100)
-                # Since mag_abs = mag_instr + ZP, plot x_range vs x_range + ZP. ZP isn't easily grabbed here, but we can compute it
                 zp_calc = valid_mags['mag_abs'].iloc[0] - valid_mags['mag_instr'].iloc[0]
                 plt.plot(x_range, x_range + zp_calc, 'r--', alpha=0.8, label=f'Fit (ZP={zp_calc:.2f})')
                 
                 plt.xlabel("Instrumental Magnitude")
-                plt.ylabel("Absolute Magnitude")
+                plt.ylabel("Magnitude")
                 plt.title(f"Absolute Photometry Overview - {os.path.basename(image_path)}")
                 plt.legend(loc='lower right')
                 plt.grid(True, alpha=0.3)
+                
+                if match_count > 0:
+                    stats_text = f"Matched Stars: {match_count}\nFit Error (StdDev): {fit_error:.3f} mag"
+                    plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
+                             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
                 
                 mag_plot_name = os.path.join(individuals_dir, f'{os.path.basename(image_path)}_mag_comparison.png')
                 plt.savefig(mag_plot_name, bbox_inches='tight')
@@ -820,6 +842,18 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         plt.colorbar(im, cax=cax, label='Theta (degrees)')
         ax.set_title(f"PSF Orientation Map - {os.path.basename(image_path)}")
         plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_theta_map.png'), bbox_inches='tight')
+        plt.close()
+
+        # Elongation Map
+        plt.figure(figsize=(10, 8))
+        grid_elongation = griddata((df['xcentroid'], df['ycentroid']), df['elongation'], (grid_x, grid_y), method='cubic')
+        ax = plt.gca()
+        im = ax.imshow(grid_elongation.T, extent=(0, nx, 0, ny), origin='lower', cmap='viridis')
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.1)
+        plt.colorbar(im, cax=cax, label='Elongation')
+        ax.set_title(f"PSF Elongation Map - {os.path.basename(image_path)}")
+        plt.savefig(os.path.join(individuals_dir, f'{os.path.basename(image_path)}_elongation_map.png'), bbox_inches='tight')
         plt.close()
 
     if wcs:
@@ -940,7 +974,9 @@ def process_image(image_path, args, figures_dir, csvs_dir):
         f"Image: {os.path.basename(image_path)}\n"
         f"Size: {nx} x {ny} px\n"
         f"Scale: {avg_scale:.3f}\"/pix\n"
-        f"Zero Point: {zero_point if zero_point else 'N/A'}\n\n"
+        f"Zero Point: {zero_point if zero_point else 'N/A'}\n"
+        f"Stars Found: {len(df) + len(df_outliers)} (Valid: {len(df)})\n"
+        f"Background: {mean:.2f} (StdDev: {std:.2f})\n\n"
         f"FWHM:\n"
         f"  Min: {fmt_stats(fwhm_px, fwhm_arc, np.min)}\n"
         f"  Max: {fmt_stats(fwhm_px, fwhm_arc, np.max)}\n"
@@ -1067,19 +1103,37 @@ def main():
             
             if not valid_df.empty:
                 plt.figure(figsize=(10, 6))
-                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Matched Stars')
+                
+                if 'catalog_mag' in combined_df.columns:
+                    matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
+                else:
+                    matched_stars = pd.DataFrame()
+                    
+                if not matched_stars.empty:
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.1, s=5, c='orange', label='Catalog Matched Stars')
+                    residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
+                    fit_error = residuals.std()
+                    match_count = len(matched_stars)
+                else:
+                    plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Measured Stars')
+                    fit_error = np.nan
+                    match_count = 0
                 
                 median_zp = (valid_df['mag_abs'] - valid_df['mag_instr']).median()
                 x_range = np.linspace(valid_df['mag_instr'].min(), valid_df['mag_instr'].max(), 100)
                 plt.plot(x_range, x_range + median_zp, 'r--', alpha=0.8, label=f'Fit (Median ZP={median_zp:.2f})')
                 
                 plt.xlabel("Instrumental Magnitude")
-                plt.ylabel("Absolute Magnitude")
+                plt.ylabel("Magnitude")
                 plt.title("Composite Absolute Photometry - All Images")
                 plt.legend(loc='lower right')
                 plt.grid(True, alpha=0.3)
                 
-                stats_text = f"Total Matched: {len(valid_df)}\nMedian ZP: {median_zp:.3f}"
+                if match_count > 0:
+                    stats_text = f"Total Matched: {match_count}\nMedian ZP: {median_zp:.3f}\nFit Error (StdDev): {fit_error:.3f} mag"
+                else:
+                    stats_text = f"Total Measured: {len(valid_df)}\nMedian ZP: {median_zp:.3f}"
+                    
                 plt.text(0.05, 0.95, stats_text, transform=plt.gca().transAxes, verticalalignment='top',
                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
                 
