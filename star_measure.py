@@ -779,7 +779,6 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     # Interpolated Maps
     if len(df) > 10:
         print("Generating interpolated maps...")
-        from scipy.interpolate import griddata
         grid_x, grid_y = np.mgrid[0:nx:100j, 0:ny:100j]
         
         # FWHM Map
