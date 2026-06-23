@@ -355,7 +355,7 @@ def detect_local_astrometry_server():
                 pass
     return None
 
-def solve_astrometry_local_cli(image_path, solve_field_path):
+def solve_astrometry_local_cli(image_path, solve_field_path, scale_low=20.0, scale_high=50.0):
     """Solves astrometry using local solve-field CLI solver."""
     import subprocess
     import tempfile
@@ -373,8 +373,8 @@ def solve_astrometry_local_cli(image_path, solve_field_path):
             "--overwrite",
             "--no-plots",
             "--scale-units", "arcsecperpix",
-            "--scale-low", "0.1",
-            "--scale-high", "100.0",
+            "--scale-low", str(scale_low),
+            "--scale-high", str(scale_high),
         ]
         
         try:
@@ -395,7 +395,7 @@ def solve_astrometry_local_cli(image_path, solve_field_path):
             
     return None
 
-def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=None):
+def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=None, scale_low=20.0, scale_high=50.0):
     """Solves astrometry using local astrometry.net if available, falling back to remote."""
     import shutil
     
@@ -416,13 +416,25 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
             if not os.path.exists(cache_dir):
                 os.makedirs(cache_dir)
                 
+            # If the astrometry package has SizeHint, we can construct and pass it
+            size_hint = None
+            if hasattr(astrometry, 'SizeHint'):
+                size_hint = astrometry.SizeHint(
+                    lower_arcsec_per_pixel=scale_low,
+                    upper_arcsec_per_pixel=scale_high
+                )
+                
             with astrometry.Solver(
                 astrometry.series_5200.index_files(
                     cache_directory=cache_dir,
                     scales={2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
                 )
             ) as solver:
-                solution = solver.solve(stars=stars)
+                if size_hint:
+                    solution = solver.solve(stars=stars, size_hint=size_hint)
+                else:
+                    solution = solver.solve(stars=stars)
+                    
                 if solution.has_match():
                     match = solution.best_match()
                     wcs = WCS(match.wcs_fields)
@@ -437,7 +449,7 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
     # 2. Try local CLI solver (solve-field)
     solve_field_path = shutil.which("solve-field")
     if solve_field_path:
-        wcs = solve_astrometry_local_cli(image_path, solve_field_path)
+        wcs = solve_astrometry_local_cli(image_path, solve_field_path, scale_low=scale_low, scale_high=scale_high)
         if wcs:
             return wcs
         print("Local solve-field failed. Trying local/remote API...")
@@ -495,14 +507,14 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
                 wcs_header = ast.solve_from_source_list(x_sorted, y_sorted, width, height, 
                                                        solve_timeout=300,
                                                        scale_units='arcsecperpix',
-                                                       scale_lower=0.1,
-                                                       scale_upper=100.0)
+                                                       scale_lower=scale_low,
+                                                       scale_upper=scale_high)
             else:
                 print("Submitting full image to Astrometry...")
                 wcs_header = ast.solve_from_image(image_path, solve_timeout=300,
                                                  scale_units='arcsecperpix',
-                                                 scale_lower=0.1,
-                                                 scale_upper=100.0)
+                                                 scale_lower=scale_low,
+                                                 scale_upper=scale_high)
                 
             if wcs_header:
                 from astropy.wcs import WCS
@@ -698,13 +710,15 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             temp_fits = os.path.join(individuals_dir, f'temp_astrometry_{os.path.basename(image_path)}.fits')
             from astropy.io import fits
             fits.writeto(temp_fits, data, overwrite=True)
-            wcs = solve_astrometry(temp_fits, sources, width=nx, height=ny, api_key=args.api_key)
+            wcs = solve_astrometry(temp_fits, sources, width=nx, height=ny, api_key=args.api_key,
+                                   scale_low=args.scale_low, scale_high=args.scale_high)
             try:
                 os.remove(temp_fits)
             except OSError:
                 pass
         else:
-            wcs = solve_astrometry(image_path, sources, width=nx, height=ny, api_key=args.api_key)
+            wcs = solve_astrometry(image_path, sources, width=nx, height=ny, api_key=args.api_key,
+                                   scale_low=args.scale_low, scale_high=args.scale_high)
             
         if not wcs:
             print("!!! Astrometry failed. Some features will be limited.")
@@ -1209,6 +1223,8 @@ def main():
     parser.add_argument("--max-image-workers", type=int, default=None, help="Max parallel images (defaults to min(cores, 4) to prevent out-of-memory).")
     parser.add_argument("--absolute", action="store_true")
     parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
+    parser.add_argument("--scale-low", type=float, default=20.0, help="Lower limit of pixel scale in arcsec/pixel (default 20.0).")
+    parser.add_argument("--scale-high", type=float, default=50.0, help="Upper limit of pixel scale in arcsec/pixel (default 50.0).")
     args = parser.parse_args()
 
     # Determine input type
