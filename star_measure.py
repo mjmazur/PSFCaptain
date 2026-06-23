@@ -581,13 +581,13 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             temp_fits = os.path.join(individuals_dir, f'temp_astrometry_{os.path.basename(image_path)}.fits')
             from astropy.io import fits
             fits.writeto(temp_fits, data, overwrite=True)
-            wcs = solve_astrometry(temp_fits, sources, api_key=args.api_key)
+            wcs = solve_astrometry(temp_fits, sources, width=nx, height=ny, api_key=args.api_key)
             try:
                 os.remove(temp_fits)
             except OSError:
                 pass
         else:
-            wcs = solve_astrometry(image_path, sources, api_key=args.api_key)
+            wcs = solve_astrometry(image_path, sources, width=nx, height=ny, api_key=args.api_key)
             
         if not wcs:
             print("!!! Astrometry failed. Some features will be limited.")
