@@ -24,6 +24,14 @@ from PIL import Image
 import concurrent.futures
 import multiprocessing
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+import time
+
+# Disable astroquery caching to prevent race conditions during parallel processing
+try:
+    from astroquery import cache_conf
+    cache_conf.cache_active = False
+except ImportError:
+    pass
 
 def safe_pixel_to_world(wcs_obj, x, y):
     """Safely handles WCS pixel_to_world conversions which may return lists of coords for multi-axis FITS."""
@@ -395,6 +403,49 @@ def solve_astrometry_local_cli(image_path, solve_field_path, scale_low=20.0, sca
             
     return None
 
+class SimpleFileLock:
+    def __init__(self, lock_dir=".astrometry_lock", timeout=300):
+        self.lock_dir = lock_dir
+        self.timeout = timeout
+
+    def __enter__(self):
+        printed_waiting = False
+        while True:
+            try:
+                os.mkdir(self.lock_dir)
+                break
+            except FileExistsError:
+                if not printed_waiting:
+                    print("Astrometry solver is currently in use by another process. Waiting for lock...")
+                    printed_waiting = True
+                try:
+                    mtime = os.path.getmtime(self.lock_dir)
+                    if time.time() - mtime > self.timeout:
+                        print(f"Warning: Lock '{self.lock_dir}' appears expired. Cleaning up...")
+                        try:
+                            os.rmdir(self.lock_dir)
+                        except OSError:
+                            pass
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.5)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            os.rmdir(self.lock_dir)
+        except OSError:
+            pass
+
+def serialize_astrometry(func):
+    from functools import wraps
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with SimpleFileLock():
+            return func(*args, **kwargs)
+    return wrapper
+
+@serialize_astrometry
 def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=None, scale_low=20.0, scale_high=50.0):
     """Solves astrometry using local astrometry.net if available, falling back to remote."""
     import shutil
@@ -407,8 +458,8 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
         if sources is not None and len(sources) > 0:
             num_sources = min(len(sources), 100)
             sorted_indices = np.argsort(sources['peak'])[::-1]
-            x_sorted = sources['xcentroid'].values[sorted_indices][:num_sources]
-            y_sorted = sources['ycentroid'].values[sorted_indices][:num_sources]
+            x_sorted = np.asarray(sources['xcentroid'])[sorted_indices][:num_sources]
+            y_sorted = np.asarray(sources['ycentroid'])[sorted_indices][:num_sources]
             stars = np.column_stack((x_sorted, y_sorted))
             
             print("Attempting local solve using python 'astrometry' package...")
@@ -501,8 +552,8 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
                 
                 print(f"Submitting top {num_sources} sources to Astrometry...")
                 sorted_indices = np.argsort(sources['peak'])[::-1]
-                x_sorted = sources['xcentroid'].values[sorted_indices][:num_sources]
-                y_sorted = sources['ycentroid'].values[sorted_indices][:num_sources]
+                x_sorted = np.asarray(sources['xcentroid'])[sorted_indices][:num_sources]
+                y_sorted = np.asarray(sources['ycentroid'])[sorted_indices][:num_sources]
                 
                 wcs_header = ast.solve_from_source_list(x_sorted, y_sorted, width, height, 
                                                        solve_timeout=300,
