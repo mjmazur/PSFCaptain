@@ -23,7 +23,10 @@ def load_image(file_path):
             return data.astype(float), header
     else:
         # PNG, BMP, JPG
-        img = Image.open(file_path).convert('L')
+        img = Image.open(file_path)
+        is_16bit = img.mode.startswith('I;16') or img.mode == 'I'
+        if not is_16bit:
+            img = img.convert('L')
         return np.array(img).astype(float), None
 
 def save_image(file_path, data, header=None, is_fits=True):
@@ -33,7 +36,11 @@ def save_image(file_path, data, header=None, is_fits=True):
         fits.writeto(file_path, data, header=header, overwrite=True)
     else:
         # Save to PNG/BMP/JPG
-        clipped_data = np.clip(data, 0, 255).astype(np.uint8)
+        # Save as 16-bit PNG/BMP if maximum value exceeds 255
+        if np.max(data) > 255:
+            clipped_data = np.clip(data, 0, 65535).astype(np.uint16)
+        else:
+            clipped_data = np.clip(data, 0, 255).astype(np.uint8)
         img = Image.fromarray(clipped_data)
         img.save(file_path)
 
