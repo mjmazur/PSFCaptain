@@ -1655,7 +1655,7 @@ def main():
             if not valid_df.empty:
                 plt.figure(figsize=(10, 6))
                                 
-                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.25, s=5, c='blue', label='All Measured Stars')
+                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.2, s=5, c='blue', label='All Measured Stars')
 
                 if 'catalog_mag' in combined_df.columns:
                     matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
@@ -1663,7 +1663,7 @@ def main():
                     matched_stars = pd.DataFrame()
                     
                 if not matched_stars.empty:
-                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.15, s=5, c='orange', label='Catalog Matched Stars')
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.1, s=5, c='orange', label='Catalog Matched Stars')
                     residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
                     fit_error = residuals.std()
                     match_count = len(matched_stars)
