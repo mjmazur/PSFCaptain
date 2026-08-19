@@ -1670,7 +1670,7 @@ def main():
                 plt.plot(x_range, x_range + median_zp, 'r--', alpha=0.8, label=f'Fit (Median ZP={median_zp:.2f})')
                 
                 plt.xlabel("Instrumental Magnitude")
-                plt.ylabel("Magnitude")
+                plt.ylabel("Absolute Magnitude")
                 # plt.title("Composite Absolute Photometry - All Images")
                 plt.legend(loc='lower right')
                 plt.grid(True, alpha=0.3)
