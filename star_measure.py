@@ -1290,7 +1290,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     # Draw circles around stars: radius = 2 * FWHM_pixels
     for _, row in df.iterrows():
         circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
-                          color='green', fill=False, linewidth=0.8, alpha=0.6)
+                          color='yellow', fill=False, linewidth=0.8, alpha=0.6)
         plt.gca().add_patch(circ)
 
     # Draw red circles around outlier stars (disabled per user request)
