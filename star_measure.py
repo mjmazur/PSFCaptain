@@ -1285,7 +1285,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     # Summary Figure
     print("Generating summary overlay figure...")
     plt.figure(figsize=(12, 10))
-    plt.imshow(data, origin='lower', cmap='gray', vmin=2700, vmax=np.percentile(data, 99.9))
+    plt.imshow(data, origin='lower', cmap='gray', vmin=2700, vmax=np.percentile(data, 99))
     
     # Draw circles around stars: radius = 2 * FWHM_pixels
     for _, row in df.iterrows():
