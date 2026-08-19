@@ -1648,9 +1648,7 @@ def main():
             
             if not valid_df.empty:
                 plt.figure(figsize=(10, 6))
-                
-                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.5, s=5, c='blue', label='All Measured Stars')
-                
+                                
                 if 'catalog_mag' in combined_df.columns:
                     matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
                 else:
@@ -1665,6 +1663,8 @@ def main():
                     fit_error = np.nan
                     match_count = 0
                 
+                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.25, s=5, c='blue', label='All Measured Stars')
+
                 median_zp = (valid_df['mag_abs'] - valid_df['mag_instr']).median()
                 x_range = np.linspace(valid_df['mag_instr'].min(), valid_df['mag_instr'].max(), 100)
                 plt.plot(x_range, x_range + median_zp, 'r--', alpha=0.8, label=f'Fit (Median ZP={median_zp:.2f})')
