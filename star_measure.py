@@ -1350,10 +1350,95 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_summary.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
+def load_local_gaia_catalog(lim_mag=None):
+    """Try to locate and load the local Gaia catalog from the RMS installation."""
+    rms_dirs = [
+        r"C:\Users\mjmaz\Documents\GitHub\RMS",
+        os.path.expanduser("~/source/RMS"),
+        os.path.expanduser("~/Documents/GitHub/RMS"),
+    ]
+    rms_dir = None
+    for d in rms_dirs:
+        if os.path.exists(d):
+            rms_dir = d
+            break
+            
+    if not rms_dir:
+        return None
+
+    cat_dir = os.path.join(rms_dir, "Catalogs")
+    cat_file = "gaia_dr2_mag_11.5.npy"
+    cat_path = os.path.join(cat_dir, cat_file)
+    if not os.path.exists(cat_path):
+        return None
+
+    try:
+        import sys
+        if rms_dir not in sys.path:
+            sys.path.append(rms_dir)
+        from RMS.Formats.StarCatalog import loadGaiaCatalog
+        data = loadGaiaCatalog(cat_dir, cat_file, lim_mag=lim_mag)
+        return data
+    except Exception as e:
+        print(f"Warning: Failed to import/run loadGaiaCatalog: {e}. Falling back to direct numpy load.")
+        try:
+            results = np.load(cat_path, allow_pickle=False)
+            if lim_mag is not None:
+                results = results[results[:, 2] <= lim_mag]
+            return results
+        except Exception as e2:
+            print(f"Error loading catalog directly: {e2}")
+            return None
+
 def _perform_single_query(center_sky, radius_deg, catalog_name):
     """Helper for a single catalog query."""
     try:
         if catalog_name == "gaia":
+            # Try loading local Gaia catalog first
+            local_data = load_local_gaia_catalog()
+            if local_data is not None:
+                # Filter by simple box mask first for speed
+                ra_min = center_sky.ra.deg - radius_deg
+                ra_max = center_sky.ra.deg + radius_deg
+                dec_min = center_sky.dec.deg - radius_deg
+                dec_max = center_sky.dec.deg + radius_deg
+                
+                if ra_min < 0 or ra_max > 360:
+                    ra_min_wrapped = ra_min % 360
+                    ra_max_wrapped = ra_max % 360
+                    if ra_min_wrapped > ra_max_wrapped:
+                        ra_mask = (local_data[:, 0] >= ra_min_wrapped) | (local_data[:, 0] <= ra_max_wrapped)
+                    else:
+                        ra_mask = (local_data[:, 0] >= ra_min_wrapped) & (local_data[:, 0] <= ra_max_wrapped)
+                else:
+                    ra_mask = (local_data[:, 0] >= ra_min) & (local_data[:, 0] <= ra_max)
+                    
+                dec_mask = (local_data[:, 1] >= dec_min) & (local_data[:, 1] <= dec_max)
+                box_mask = ra_mask & dec_mask
+                filtered = local_data[box_mask]
+                
+                # Apply precise separation check
+                if len(filtered) > 0:
+                    catalog_coords = SkyCoord(ra=filtered[:, 0]*u.deg, dec=filtered[:, 1]*u.deg)
+                    sep = center_sky.separation(catalog_coords)
+                    circle_mask = sep.deg <= radius_deg
+                    filtered = filtered[circle_mask]
+                    
+                # Format as astropy Table to match astroquery interface
+                from astropy.table import Table
+                table = Table()
+                if len(filtered) > 0:
+                    table['ra'] = filtered[:, 0]
+                    table['dec'] = filtered[:, 1]
+                    table['phot_g_mean_mag'] = filtered[:, 2]
+                else:
+                    table['ra'] = np.array([], dtype=float)
+                    table['dec'] = np.array([], dtype=float)
+                    table['phot_g_mean_mag'] = np.array([], dtype=float)
+                print(f"Loaded {len(table)} stars from local Gaia catalog.")
+                return table
+                
+            print("Local Gaia catalog not found. Falling back to online Gaia...")
             from astroquery.gaia import Gaia
             job = Gaia.cone_search_async(center_sky, radius=radius_deg * u.deg)
             return job.get_results()
