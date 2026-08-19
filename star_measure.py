@@ -1369,6 +1369,32 @@ def _perform_single_query(center_sky, radius_deg, catalog_name):
     return None
 
 def main():
+    import sys
+    # Preprocess sys.argv to combine catalog name and optional magnitude limit if space-separated
+    # e.g., ['--catalog', 'gaia', '12.0'] -> ['--catalog', 'gaia:12.0']
+    new_argv = []
+    i = 0
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == '--catalog' and i + 1 < len(sys.argv):
+            catalog_name = sys.argv[i+1]
+            if i + 2 < len(sys.argv):
+                next_arg = sys.argv[i+2]
+                try:
+                    float(next_arg)
+                    combined = f"{catalog_name}:{next_arg}"
+                    new_argv.extend([arg, combined])
+                    i += 3
+                    continue
+                except ValueError:
+                    pass
+            new_argv.extend([arg, catalog_name])
+            i += 2
+        else:
+            new_argv.append(arg)
+            i += 1
+    sys.argv = new_argv
+
     parser = argparse.ArgumentParser(description="Find and measure stars.")
     parser.add_argument("image", help="Path to an image file or a directory of images.")
     parser.add_argument("--astrometry", action="store_true")
@@ -1388,30 +1414,29 @@ def main():
     parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2), help="Cores for general parallel tasks.")
     parser.add_argument("--max-image-workers", type=int, default=None, help="Max parallel images (defaults to min(cores, 4) to prevent out-of-memory).")
     parser.add_argument("--absolute", action="store_true")
-    parser.add_argument("--catalog", nargs='+', default=["gaia"])
+    parser.add_argument("--catalog", default="gaia")
     parser.add_argument("--scale-low", type=float, default=20.0, help="Lower limit of pixel scale in arcsec/pixel (default 20.0).")
     parser.add_argument("--scale-high", type=float, default=50.0, help="Upper limit of pixel scale in arcsec/pixel (default 50.0).")
     args = parser.parse_args()
 
-    # Parse catalog arguments (supports both catalog name and optional magnitude limit, default is gaia 12.0)
-    catalog_args = args.catalog
-    if isinstance(catalog_args, list) and len(catalog_args) > 0:
-        catalog_name = catalog_args[0].lower()
-        if catalog_name not in ["gaia", "tycho2"]:
-            parser.error(f"argument --catalog: invalid choice: '{catalog_name}' (choose from 'gaia', 'tycho2')")
-        
-        gaia_mag_limit = 12.0
-        if len(catalog_args) > 1:
-            try:
-                gaia_mag_limit = float(catalog_args[1])
-            except ValueError:
-                parser.error(f"argument --catalog: invalid magnitude limit: '{catalog_args[1]}'")
-        
-        args.catalog = catalog_name
-        args.gaia_mag_limit = gaia_mag_limit
+    # Parse catalog and magnitude limit
+    catalog_str = args.catalog
+    if ":" in catalog_str:
+        catalog_name, mag_limit_str = catalog_str.split(":", 1)
+        try:
+            gaia_mag_limit = float(mag_limit_str)
+        except ValueError:
+            parser.error(f"argument --catalog: invalid magnitude limit: '{mag_limit_str}'")
     else:
-        args.catalog = "gaia"
-        args.gaia_mag_limit = 12.0
+        catalog_name = catalog_str
+        gaia_mag_limit = 12.0
+
+    catalog_name = catalog_name.lower()
+    if catalog_name not in ["gaia", "tycho2"]:
+        parser.error(f"argument --catalog: invalid choice: '{catalog_name}' (choose from 'gaia', 'tycho2')")
+
+    args.catalog = catalog_name
+    args.gaia_mag_limit = gaia_mag_limit
 
     # Determine input type
     image_list = []
