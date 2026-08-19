@@ -1649,7 +1649,7 @@ def main():
             if not valid_df.empty:
                 plt.figure(figsize=(10, 6))
                 
-                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Measured Stars')
+                plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.5, s=5, c='blue', label='All Measured Stars')
                 
                 if 'catalog_mag' in combined_df.columns:
                     matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
