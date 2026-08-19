@@ -1293,12 +1293,12 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                           color='green', fill=False, linewidth=0.8, alpha=0.6)
         plt.gca().add_patch(circ)
 
-    # Draw red circles around outlier stars
-    if not df_outliers.empty:
-        for _, row in df_outliers.iterrows():
-            circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
-                              color='red', fill=False, linewidth=0.8, alpha=0.6)
-            plt.gca().add_patch(circ)
+    # Draw red circles around outlier stars (disabled per user request)
+    # if not df_outliers.empty:
+    #     for _, row in df_outliers.iterrows():
+    #         circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
+    #                           color='red', fill=False, linewidth=0.8, alpha=0.6)
+    #         plt.gca().add_patch(circ)
 
     # Info box
     fwhm_px = df['fwhm'].values
@@ -1440,6 +1440,57 @@ def main():
             process_image(img, args, figures_dir, csvs_dir)
 
     print("\nBatch processing complete.")
+
+    # Print summary of average PSF values for all images looked at
+    print("\n=====================================================================================")
+    print("                      SUMMARY OF AVERAGE PSF VALUES (FWHM)")
+    print("=====================================================================================")
+    
+    psf_data = []
+    for img in image_list:
+        csv_path = os.path.join(csvs_dir, f'{os.path.basename(img)}_results.csv')
+        if os.path.exists(csv_path):
+            try:
+                df_results = pd.read_csv(csv_path)
+                if not df_results.empty and 'fwhm' in df_results.columns:
+                    mean_fwhm_px = df_results['fwhm'].mean()
+                    
+                    # Check if 'fwhm_arc' exists and contains non-NaN values
+                    if 'fwhm_arc' in df_results.columns and not df_results['fwhm_arc'].isna().all():
+                        mean_fwhm_arc = df_results['fwhm_arc'].mean()
+                    else:
+                        mean_fwhm_arc = np.nan
+                        
+                    psf_data.append({
+                        'image': os.path.basename(img),
+                        'fwhm_px': mean_fwhm_px,
+                        'fwhm_arc': mean_fwhm_arc,
+                        'count': len(df_results)
+                    })
+            except Exception as e:
+                print(f"Error reading results for {os.path.basename(img)}: {e}")
+
+    if psf_data:
+        print(f"{'Image Name':<45} | {'Stars':<5} | {'Avg FWHM (px)':<14} | {'Avg FWHM (arcsec)':<17}")
+        print("-" * 92)
+        all_px = []
+        all_arc = []
+        for item in psf_data:
+            px_str = f"{item['fwhm_px']:.2f}"
+            arc_str = f"{item['fwhm_arc']:.2f}\"" if not np.isnan(item['fwhm_arc']) and item['fwhm_arc'] > 0 else "N/A"
+            print(f"{item['image']:<45} | {item['count']:<5d} | {px_str:<14} | {arc_str:<17}")
+            all_px.append(item['fwhm_px'])
+            if not np.isnan(item['fwhm_arc']) and item['fwhm_arc'] > 0:
+                all_arc.append(item['fwhm_arc'])
+        
+        print("-" * 92)
+        overall_px = np.mean(all_px)
+        overall_arc = np.mean(all_arc) if all_arc else np.nan
+        overall_arc_str = f"{overall_arc:.2f}\"" if not np.isnan(overall_arc) else "N/A"
+        print(f"{'OVERALL AVERAGE':<45} | {'-':<5} | {overall_px:<14.2f} | {overall_arc_str:<17}")
+    else:
+        print("No valid PSF measurements found.")
+    print("=====================================================================================\n")
 
     if args.absolute:
         print("Generating composite magnitude plot...")
