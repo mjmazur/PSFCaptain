@@ -1556,7 +1556,7 @@ def main():
                 plt.hist(valid_df['mag_abs'], bins=40, color='purple', alpha=0.7, edgecolor='black')
                 plt.xlabel("Absolute Magnitude")
                 plt.ylabel("Frequency")
-                plt.title("Composite Absolute Magnitude Distribution - All Images")
+                # plt.title("Composite Absolute Magnitude Distribution - All Images")
                 plt.grid(True, alpha=0.3)
                 
                 # Add stats box for the histogram
