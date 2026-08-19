@@ -991,16 +991,23 @@ def process_image(image_path, args, figures_dir, csvs_dir):
             catalog_results = query_catalog_tiled(center_sky, radius, args.catalog)
             
             if catalog_results is not None and len(catalog_results) > 0:
-                cat_ra = catalog_results['ra'] if 'ra' in catalog_results.colnames else catalog_results['RA(ICRS)']
-                cat_dec = catalog_results['dec'] if 'dec' in catalog_results.colnames else catalog_results['DE(ICRS)']
-                
-                # Magnitude column depends on catalog
                 if args.catalog == 'gaia':
-                    cat_mag = catalog_results['phot_g_mean_mag']
-                    mag_label = "Gaia G"
-                else: # tycho2
-                    cat_mag = catalog_results['VTmag']
-                    mag_label = "Tycho-2 VT"
+                    # Filter by magnitude limit (default 12.0 or user-specified)
+                    mag_mask = catalog_results['phot_g_mean_mag'] < args.gaia_mag_limit
+                    catalog_results = catalog_results[mag_mask]
+                    print(f"Filtered Gaia catalog to {len(catalog_results)} stars brighter than magnitude {args.gaia_mag_limit}.")
+                
+                if len(catalog_results) > 0:
+                    cat_ra = catalog_results['ra'] if 'ra' in catalog_results.colnames else catalog_results['RA(ICRS)']
+                    cat_dec = catalog_results['dec'] if 'dec' in catalog_results.colnames else catalog_results['DE(ICRS)']
+                    
+                    # Magnitude column depends on catalog
+                    if args.catalog == 'gaia':
+                        cat_mag = catalog_results['phot_g_mean_mag']
+                        mag_label = "Gaia G"
+                    else: # tycho2
+                        cat_mag = catalog_results['VTmag']
+                        mag_label = "Tycho-2 VT"
 
                 catalog_coords = SkyCoord(ra=cat_ra, dec=cat_dec, unit=u.deg)
                 star_coords = safe_pixel_to_world(wcs, df['xcentroid'], df['ycentroid'])
@@ -1381,10 +1388,30 @@ def main():
     parser.add_argument("--cores", type=int, default=max(1, multiprocessing.cpu_count() - 2), help="Cores for general parallel tasks.")
     parser.add_argument("--max-image-workers", type=int, default=None, help="Max parallel images (defaults to min(cores, 4) to prevent out-of-memory).")
     parser.add_argument("--absolute", action="store_true")
-    parser.add_argument("--catalog", choices=["gaia", "tycho2"], default="gaia")
+    parser.add_argument("--catalog", nargs='+', default=["gaia"])
     parser.add_argument("--scale-low", type=float, default=20.0, help="Lower limit of pixel scale in arcsec/pixel (default 20.0).")
     parser.add_argument("--scale-high", type=float, default=50.0, help="Upper limit of pixel scale in arcsec/pixel (default 50.0).")
     args = parser.parse_args()
+
+    # Parse catalog arguments (supports both catalog name and optional magnitude limit, default is gaia 12.0)
+    catalog_args = args.catalog
+    if isinstance(catalog_args, list) and len(catalog_args) > 0:
+        catalog_name = catalog_args[0].lower()
+        if catalog_name not in ["gaia", "tycho2"]:
+            parser.error(f"argument --catalog: invalid choice: '{catalog_name}' (choose from 'gaia', 'tycho2')")
+        
+        gaia_mag_limit = 12.0
+        if len(catalog_args) > 1:
+            try:
+                gaia_mag_limit = float(catalog_args[1])
+            except ValueError:
+                parser.error(f"argument --catalog: invalid magnitude limit: '{catalog_args[1]}'")
+        
+        args.catalog = catalog_name
+        args.gaia_mag_limit = gaia_mag_limit
+    else:
+        args.catalog = "gaia"
+        args.gaia_mag_limit = 12.0
 
     # Determine input type
     image_list = []
