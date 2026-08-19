@@ -1103,7 +1103,13 @@ def process_image(image_path, args, figures_dir, csvs_dir):
                 plt.xlabel("Instrumental Magnitude")
                 plt.ylabel("Magnitude")
                 plt.title(f"Absolute Photometry Overview - {os.path.basename(image_path)}")
-                plt.legend(loc='lower right')
+                leg = plt.legend(loc='lower right')
+                if hasattr(leg, 'legend_handles'):
+                    for lh in leg.legend_handles:
+                        lh.set_alpha(1.0)
+                elif hasattr(leg, 'legendHandles'):
+                    for lh in leg.legendHandles:
+                        lh.set_alpha(1.0)
                 plt.grid(True, alpha=0.3)
                 
                 if match_count > 0:
@@ -1657,7 +1663,7 @@ def main():
                     matched_stars = pd.DataFrame()
                     
                 if not matched_stars.empty:
-                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.25, s=5, c='orange', label='Catalog Matched Stars')
+                    plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.15, s=5, c='orange', label='Catalog Matched Stars')
                     residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
                     fit_error = residuals.std()
                     match_count = len(matched_stars)
@@ -1672,7 +1678,13 @@ def main():
                 plt.xlabel("Instrumental Magnitude")
                 plt.ylabel("Absolute Magnitude")
                 # plt.title("Composite Absolute Photometry - All Images")
-                plt.legend(loc='lower right')
+                leg = plt.legend(loc='lower right')
+                if hasattr(leg, 'legend_handles'):
+                    for lh in leg.legend_handles:
+                        lh.set_alpha(1.0)
+                elif hasattr(leg, 'legendHandles'):
+                    for lh in leg.legendHandles:
+                        lh.set_alpha(1.0)
                 plt.grid(True, alpha=0.3)
                 
                 if match_count > 0:
