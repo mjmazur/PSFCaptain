@@ -1285,7 +1285,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     # Summary Figure
     print("Generating summary overlay figure...")
     plt.figure(figsize=(12, 10))
-    plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 99))
+    plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 95))
     
     # Draw circles around stars: radius = 2 * FWHM_pixels
     for _, row in df.iterrows():
@@ -1339,7 +1339,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=10, fontfamily='monospace')
     
-    plt.title(f"Star Detection Summary - {os.path.basename(image_path)}")
+    #plt.title(f"Star Detection Summary - {os.path.basename(image_path)}")
     plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_summary.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -1534,7 +1534,7 @@ def main():
                 
                 plt.xlabel("Instrumental Magnitude")
                 plt.ylabel("Magnitude")
-                plt.title("Composite Absolute Photometry - All Images")
+                # plt.title("Composite Absolute Photometry - All Images")
                 plt.legend(loc='lower right')
                 plt.grid(True, alpha=0.3)
                 
