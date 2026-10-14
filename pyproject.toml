@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psfcaptain"
+version = "0.1.0"
+description = "Star detection, photometry and PSF morphology for astronomical images"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+    "numpy<2.0.0",
+    "pandas",
+    "matplotlib",
+    "scipy",
+    "astropy",
+    "photutils",
+    "astroquery",
+    "pillow",
+    "scikit-learn",
+]
+
+[project.optional-dependencies]
+local-solver = ["astrometry"]
+
+[project.scripts]
+psfcaptain = "psfcaptain.cli:main"
+
+[tool.setuptools]
+packages = ["psfcaptain"]

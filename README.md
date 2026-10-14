@@ -28,6 +28,28 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 - **Astrometric Integration**: Seamless integration with `astrometry.net` for RA/Dec solving.
 - **Comprehensive Visualization**: Generates heatmaps, histograms, and star-field summary overlays.
 
+## Project Layout
+
+```
+psfcaptain/          Core package
+  cli.py             Argument parsing and batch orchestration
+  pipeline.py        Per-image pipeline (detect -> measure -> calibrate -> plot)
+  image_io.py        FITS / PNG / BMP loading
+  detection.py       Background subtraction and star detection (incl. two-pass)
+  finders.py         RMSStarFinder and its Gaussian fitting helpers
+  morphology.py      Per-star FWHM, elongation and orientation measurement
+  astrometry.py      Plate solving (local package, solve-field CLI, or API)
+  catalogs.py        Gaia / Tycho-2 queries with tiling for large fields
+  photometry.py      Instrumental magnitudes, outlier rejection, zero-point fit
+  plots.py           All figure generation
+  wcs_utils.py       Shared WCS helpers
+tools/               Standalone FITS utilities (binning, stacking, header edits)
+tests/               Tests
+data/                Sample and session input images
+results/             Archived outputs from previous runs
+star_measure.py      Thin wrapper kept for backwards compatibility
+```
+
 ## Installation
 
 ### Prerequisites
@@ -40,53 +62,65 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
 conda create -n rms python=3.10
 conda activate rms
 
-# Install dependencies
-pip install numpy==1.26.4 pandas matplotlib astropy photutils astroquery pillow
+# Install the package and its dependencies
+pip install -e .
+
+# Optional: offline plate solving with cached index files
+pip install -e ".[local-solver]"
 ```
 
-### Batch Processing (Directory)
-Process all images in a folder and organize outputs:
+### Running
+
+All three invocations are equivalent:
+
 ```bash
-python star_measure.py path/to/images/ --cores 8 --sky --finder iraf
+python -m psfcaptain data/test.fits      # module entry point
+psfcaptain data/test.fits                # console script (after pip install)
+python star_measure.py data/test.fits    # legacy wrapper
 ```
-
-### Absolute Photometry (Calibration)
-To calibrate your magnitudes, you must first solve for astrometry. You can choose between Gaia and Tycho-2 catalogs:
-```bash
-# Calibrate against Gaia (Default)
-python star_measure.py image.fits --astrometry --absolute
-
-# Calibrate against Tycho-2 (Recommended for bright stars mag 0-9)
-python star_measure.py image.fits --astrometry --absolute --catalog tycho2
-```
-
-### Performance Tuning
-The script automatically parallelizes work based on the input:
-- **Directory Input**: Processes multiple images concurrently.
-- **Single Image**: Processes stars within the image concurrently.
-The default core count is `CPU_COUNT - 2` to maintain system stability.
 
 ## Usage
 
 ### Basic Processing
 ```bash
-python star_measure.py image.fits --cores 4
+python -m psfcaptain image.fits --cores 4
+```
+
+### Batch Processing (Directory)
+Process all images in a folder and organize outputs:
+```bash
+python -m psfcaptain path/to/images/ --cores 8 --sky --finder iraf
 ```
 
 ### Absolute Photometry (Calibration)
 To calibrate your magnitudes, you must first solve for astrometry. You can choose between Gaia and Tycho-2 catalogs:
 ```bash
 # Calibrate against Gaia (Default)
-python star_measure.py image.fits --astrometry --absolute
+python -m psfcaptain image.fits --astrometry --absolute
 
 # Calibrate against Tycho-2 (Recommended for bright stars mag 0-9)
-python star_measure.py image.fits --astrometry --absolute --catalog tycho2
+python -m psfcaptain image.fits --astrometry --absolute --catalog tycho2
 ```
 
 ### Multiprocessing
 Speed up morphology measurements on large files by using multiple CPU cores:
 ```bash
-python star_measure.py image.fits --cores 8
+python -m psfcaptain image.fits --cores 8
+```
+
+The script parallelizes based on the input: a directory processes multiple images
+concurrently, a single image processes its stars concurrently. The default core
+count is `CPU_COUNT - 2` to maintain system stability.
+
+### FITS Utilities
+Standalone helpers in `tools/`, each with its own `--help`:
+```bash
+python tools/bin_fits.py input.fits --bin 2 --method average  # Bin pixels, updating the WCS
+python tools/stack_images.py frames/ --method median --output stack.fits
+python tools/transform_fits.py input.fits --rotate 90 --flip-rows
+python tools/edit_fits_header.py input.fits EXPTIME 10.0
+python tools/check_fits.py input.fits                         # Shape/dtype of each HDU
+python tools/inspect_wcs.py                                   # Pixel scales in the solver cache
 ```
 
 ## Output
@@ -101,7 +135,7 @@ A file named `[image_name]_results.csv` containing:
 - `elongation`, `theta`: Star shape characteristics.
 
 ### 2. Figures
-Saved in the `Figures/` root directory:
+Saved in the `Figures/` output directory:
 - `[image_name]_summary.png`: Master star field overlay with red/green detection circles and metrics box.
 
 Saved in the `Figures/Individuals/` rendering directory:
@@ -119,6 +153,7 @@ Saved in the `Figures/Individuals/` rendering directory:
 - `--sky`: Enable 2D local background estimation (improves detection in uneven fields).
 - `--cores`: Number of CPU cores to use (default: CPU_COUNT - 2).
 - `--exclude-border`: Ignore stars detected near the image edges.
+- `--output-dir`: Where to write `Figures/` and `CSVs/` (defaults to the input image's directory).
 
 ### Calibration & Analysis
 - `--astrometry`: Solve for RA/Dec via Astrometry.net.
