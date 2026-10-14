@@ -172,10 +172,15 @@ class RMSStarFinder:
             if intensity <= 0:
                 continue
                 
-            sigma_fitted = np.sqrt(sigma_x**2 + sigma_y**2)
+            # Geometric mean of the axes: the sigma of the equal-area circular Gaussian.
+            sigma_fitted = np.sqrt(abs(sigma_x * sigma_y))
             fwhm_val = 2.355 * sigma_fitted
             elongation_val = max(abs(sigma_x), abs(sigma_y)) / max(min(abs(sigma_x), abs(sigma_y)), 1e-6)
-            theta_deg = np.degrees(theta) % 360
+            # The fit runs on (row, col) grids, so `sigma_y` is the fitted sigma along its first
+            # axis. Convert to the photutils convention: major-axis angle, degrees counter-clockwise
+            # from +x, in [-90, 90).
+            major_offset = 90.0 if abs(sigma_y) >= abs(sigma_x) else 0.0
+            theta_deg = (np.degrees(theta) + major_offset + 90.0) % 180.0 - 90.0
             
             x_fitted.append(x_min + xo)
             y_fitted.append(y_min + yo)
