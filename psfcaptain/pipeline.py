@@ -7,7 +7,7 @@ from psfcaptain.astrometry import solve_for_image
 from psfcaptain.detection import detect_stars, subtract_background
 from psfcaptain.image_io import load_image
 from psfcaptain.morphology import compute_fwhm_arcsec, measure_morphology
-from psfcaptain.photometry import calibrate_absolute, reject_fwhm_outliers, to_dataframe
+from psfcaptain.photometry import calibrate_absolute, reject_fwhm_outliers, reject_psf_limit, to_dataframe
 
 
 def process_image(image_path, args, figures_dir, csvs_dir):
@@ -34,6 +34,7 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     df = to_dataframe(sources)
     df = measure_morphology(df, data_sub, std, wcs, nx, ny, args)
     df, df_outliers = reject_fwhm_outliers(df)
+    df, df_outliers = reject_psf_limit(df, df_outliers, args.psf_limit)
     df = compute_fwhm_arcsec(df, wcs)
 
     zero_point = calibrate_absolute(df, wcs, nx, ny, args)

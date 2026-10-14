@@ -10,4 +10,11 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_DOMAIN_NUM_THREADS"] = "1"
 
+# Disable astroquery caching to prevent race conditions during parallel processing.
+try:
+    from astroquery import cache_conf
+    cache_conf.cache_active = False
+except ImportError:
+    pass
+
 __version__ = "0.1.0"

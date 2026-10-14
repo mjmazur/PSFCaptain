@@ -44,7 +44,13 @@ def plot_catalog_diagnostics(results_csv, image_path, individuals_dir):
                 plt.xlabel("Instrumental Magnitude")
                 plt.ylabel("Magnitude")
                 plt.title(f"Absolute Photometry Overview - {os.path.basename(image_path)}")
-                plt.legend(loc='lower right')
+                leg = plt.legend(loc='lower right')
+                if hasattr(leg, 'legend_handles'):
+                    for lh in leg.legend_handles:
+                        lh.set_alpha(1.0)
+                elif hasattr(leg, 'legendHandles'):
+                    for lh in leg.legendHandles:
+                        lh.set_alpha(1.0)
                 plt.grid(True, alpha=0.3)
                 
                 if match_count > 0:
@@ -231,20 +237,20 @@ def plot_summary(data, df, df_outliers, wcs, scales, nx, ny, mean, std, zero_poi
     # Summary Figure
     print("Generating summary overlay figure...")
     plt.figure(figsize=(12, 10))
-    plt.imshow(data, origin='lower', cmap='gray', vmax=np.percentile(data, 99))
-    
+    plt.imshow(data, origin='lower', cmap='gray', vmin=np.percentile(data, 0.02), vmax=np.percentile(data, 99))
+
     # Draw circles around stars: radius = 2 * FWHM_pixels
     for _, row in df.iterrows():
-        circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
-                          color='green', fill=False, linewidth=0.8, alpha=0.6)
+        circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'],
+                          color='yellow', fill=False, linewidth=0.8, alpha=0.6)
         plt.gca().add_patch(circ)
 
-    # Draw red circles around outlier stars
-    if not df_outliers.empty:
-        for _, row in df_outliers.iterrows():
-            circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'], 
-                              color='red', fill=False, linewidth=0.8, alpha=0.6)
-            plt.gca().add_patch(circ)
+    # Draw red circles around outlier stars (disabled per user request)
+    # if not df_outliers.empty:
+    #     for _, row in df_outliers.iterrows():
+    #         circ = plt.Circle((row['xcentroid'], row['ycentroid']), 2 * row['fwhm'],
+    #                           color='red', fill=False, linewidth=0.8, alpha=0.6)
+    #         plt.gca().add_patch(circ)
 
     # Info box
     fwhm_px = df['fwhm'].values
@@ -283,7 +289,7 @@ def plot_summary(data, df, df_outliers, wcs, scales, nx, ny, mean, std, zero_poi
     plt.text(0.02, 0.98, info_text, transform=plt.gca().transAxes, verticalalignment='top',
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), fontsize=10, fontfamily='monospace')
     
-    plt.title(f"Star Detection Summary - {os.path.basename(image_path)}")
+    #plt.title(f"Star Detection Summary - {os.path.basename(image_path)}")
     plt.savefig(os.path.join(figures_dir, f'{os.path.basename(image_path)}_summary.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
@@ -309,15 +315,15 @@ def plot_composite(image_list, csvs_dir, figures_dir):
         if not valid_df.empty:
             plt.figure(figsize=(10, 6))
             
-            plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.1, s=5, c='blue', label='All Measured Stars')
-            
+            plt.scatter(valid_df['mag_instr'], valid_df['mag_abs'], alpha=0.2, s=5, c='blue', label='All Measured Stars')
+
             if 'catalog_mag' in combined_df.columns:
                 matched_stars = combined_df.dropna(subset=['catalog_mag', 'mag_instr'])
             else:
                 matched_stars = pd.DataFrame()
-                
+
             if not matched_stars.empty:
-                plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.3, s=5, c='orange', label='Catalog Matched Stars')
+                plt.scatter(matched_stars['mag_instr'], matched_stars['catalog_mag'], alpha=0.1, s=5, c='orange', label='Catalog Matched Stars')
                 residuals = matched_stars['mag_abs'] - matched_stars['catalog_mag']
                 fit_error = residuals.std()
                 match_count = len(matched_stars)
@@ -330,9 +336,15 @@ def plot_composite(image_list, csvs_dir, figures_dir):
             plt.plot(x_range, x_range + median_zp, 'r--', alpha=0.8, label=f'Fit (Median ZP={median_zp:.2f})')
             
             plt.xlabel("Instrumental Magnitude")
-            plt.ylabel("Magnitude")
-            plt.title("Composite Absolute Photometry - All Images")
-            plt.legend(loc='lower right')
+            plt.ylabel("Absolute Magnitude")
+            # plt.title("Composite Absolute Photometry - All Images")
+            leg = plt.legend(loc='lower right')
+            if hasattr(leg, 'legend_handles'):
+                for lh in leg.legend_handles:
+                    lh.set_alpha(1.0)
+            elif hasattr(leg, 'legendHandles'):
+                for lh in leg.legendHandles:
+                    lh.set_alpha(1.0)
             plt.grid(True, alpha=0.3)
             
             if match_count > 0:
@@ -353,7 +365,7 @@ def plot_composite(image_list, csvs_dir, figures_dir):
             plt.hist(valid_df['mag_abs'], bins=40, color='purple', alpha=0.7, edgecolor='black')
             plt.xlabel("Absolute Magnitude")
             plt.ylabel("Frequency")
-            plt.title("Composite Absolute Magnitude Distribution - All Images")
+            # plt.title("Composite Absolute Magnitude Distribution - All Images")
             plt.grid(True, alpha=0.3)
             
             # Add stats box for the histogram

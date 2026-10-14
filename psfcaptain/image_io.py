@@ -28,16 +28,21 @@ def load_image(file_path):
                 data = data[0]
             return data.astype(float), header
     elif ext in ['.png', '.bmp']:
-        img = Image.open(file_path).convert('L')
+        img = Image.open(file_path)
+        is_16bit = img.mode.startswith('I;16') or img.mode == 'I'
+        if not is_16bit:
+            img = img.convert('L')
         data = np.array(img).astype(float)
         header = None
-        
+
         # Check if background is light (e.g., inverted image)
         # If median is closer to max than min, it's likely light background
-        if np.median(data) > 127:
+        threshold = 32767.0 if is_16bit else 127.0
+        if np.median(data) > threshold:
             print("Detected light background image. Inverting for processing...")
-            data = np.max(data) - data
-            
+            max_val = 65535.0 if is_16bit else 255.0
+            data = max_val - data
+
         return data, header
     else:
         raise ValueError(f"Unsupported file format: {ext}")

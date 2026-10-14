@@ -1,8 +1,56 @@
 """Astrometric plate solving via local solvers or the astrometry.net API."""
 
 import os
+import time
+from functools import wraps
 
 import numpy as np
+
+
+class SimpleFileLock:
+    """Directory-based lock serializing astrometry solves across worker processes."""
+
+    def __init__(self, lock_dir=".astrometry_lock", timeout=300):
+        self.lock_dir = lock_dir
+        self.timeout = timeout
+
+    def __enter__(self):
+        printed_waiting = False
+        while True:
+            try:
+                os.mkdir(self.lock_dir)
+                break
+            except FileExistsError:
+                if not printed_waiting:
+                    print("Astrometry solver is currently in use by another process. Waiting for lock...")
+                    printed_waiting = True
+                try:
+                    mtime = os.path.getmtime(self.lock_dir)
+                    if time.time() - mtime > self.timeout:
+                        print(f"Warning: Lock '{self.lock_dir}' appears expired. Cleaning up...")
+                        try:
+                            os.rmdir(self.lock_dir)
+                        except OSError:
+                            pass
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.5)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            os.rmdir(self.lock_dir)
+        except OSError:
+            pass
+
+
+def serialize_astrometry(func):
+    """Decorator serializing calls to the wrapped solver via SimpleFileLock."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        with SimpleFileLock():
+            return func(*args, **kwargs)
+    return wrapper
 
 
 def detect_local_astrometry_server():
@@ -74,17 +122,31 @@ def solve_astrometry_local_cli(image_path, solve_field_path, scale_low=20.0, sca
             
     return None
 
+@serialize_astrometry
 def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=None, scale_low=20.0, scale_high=50.0):
     """Solves astrometry using local astrometry.net if available, falling back to remote."""
     import shutil
-    
+
+    if sources is not None and len(sources) > 0:
+        # Filter out NaN/Inf values from centroid columns and peak/flux column to prevent solver crashes
+        x_raw = np.asarray(sources['xcentroid'])
+        y_raw = np.asarray(sources['ycentroid'])
+        peak_raw = np.asarray(sources['peak']) if 'peak' in sources.colnames else np.ones_like(x_raw)
+
+        valid_mask = (
+            ~np.isnan(x_raw) & ~np.isinf(x_raw) &
+            ~np.isnan(y_raw) & ~np.isinf(y_raw) &
+            ~np.isnan(peak_raw) & ~np.isinf(peak_raw)
+        )
+        sources = sources[valid_mask]
+
     # 1. Try python 'astrometry' package (installed via pip install astrometry)
     try:
         import astrometry
         from astropy.wcs import WCS
-        
+
         if sources is not None and len(sources) > 0:
-            num_sources = min(len(sources), 100)
+            num_sources = min(len(sources), 50)
             sorted_indices = np.argsort(sources['peak'])[::-1]
             x_sorted = np.asarray(sources['xcentroid'])[sorted_indices][:num_sources]
             y_sorted = np.asarray(sources['ycentroid'])[sorted_indices][:num_sources]
@@ -148,12 +210,14 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
     servers_to_try.append(('https://nova.astrometry.net/api', api_key))
 
     for server_url, key in servers_to_try:
-        print(f"Trying astrometry solve via API at {server_url}...")
+        is_local = "localhost" in server_url or "127.0.0.1" in server_url
+        server_type = "LOCAL" if is_local else "ONLINE"
+        print(f"Trying astrometry solve via {server_type} API at {server_url}...")
         try:
             # Set server URL in conf
             from astroquery.astrometry_net import conf
             conf.server = server_url
-            
+
             ast = AstrometryNet()
             ast.cache_location = os.path.join(os.getcwd(), '.astrometry_cache')
             if not os.path.exists(ast.cache_location):
@@ -166,29 +230,109 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
             else:
                 ast.api_key = 'aifriketqrtctpor'
 
-            # Run solving
-            if sources is not None and width is not None and height is not None:
-                num_sources = min(len(sources), 100)
-                if num_sources < 10:
-                    print(f"Warning: Only {num_sources} stars found. Astrometry may fail without more stars.")
-                
-                print(f"Submitting top {num_sources} sources to Astrometry...")
-                sorted_indices = np.argsort(sources['peak'])[::-1]
-                x_sorted = np.asarray(sources['xcentroid'])[sorted_indices][:num_sources]
-                y_sorted = np.asarray(sources['ycentroid'])[sorted_indices][:num_sources]
-                
-                wcs_header = ast.solve_from_source_list(x_sorted, y_sorted, width, height, 
-                                                       solve_timeout=300,
-                                                       scale_units='arcsecperpix',
-                                                       scale_lower=scale_low,
-                                                       scale_upper=scale_high)
-            else:
-                print("Submitting full image to Astrometry...")
-                wcs_header = ast.solve_from_image(image_path, solve_timeout=300,
-                                                 scale_units='arcsecperpix',
-                                                 scale_lower=scale_low,
-                                                 scale_upper=scale_high)
-                
+            # Disable Keep-Alive to prevent RemoteDisconnected errors when polling status
+            if hasattr(ast, '_session') and hasattr(ast._session, 'headers'):
+                ast._session.headers['Connection'] = 'close'
+
+            # Run solving with retries for transient network/connection errors
+            max_retries = 3
+            wcs_header = None
+            for attempt in range(max_retries):
+                try:
+                    if sources is not None and width is not None and height is not None:
+                        num_sources = min(len(sources), 50)
+                        if num_sources < 10:
+                            print(f"Warning: Only {num_sources} stars found. Astrometry may fail without more stars.")
+
+                        if attempt == 0:
+                            print(f"Submitting top {num_sources} sources to Astrometry...")
+                        else:
+                            print(f"Submitting top {num_sources} sources to Astrometry (Attempt {attempt+1}/{max_retries})...")
+
+                        sorted_indices = np.argsort(sources['peak'])[::-1]
+                        x_sorted = np.asarray(sources['xcentroid'])[sorted_indices][:num_sources]
+                        y_sorted = np.asarray(sources['ycentroid'])[sorted_indices][:num_sources]
+
+                        try:
+                            wcs_header = ast.solve_from_source_list(x_sorted, y_sorted, width, height,
+                                                                   solve_timeout=180,
+                                                                   scale_units='arcsecperpix',
+                                                                   scale_lower=scale_low,
+                                                                   scale_upper=scale_high)
+                        except Exception as e_src:
+                            print(f"Source list solve encountered error/timeout: {e_src}.")
+
+                        if not wcs_header:
+                            print("Source list solve failed or timed out. Extracting astrometry-optimized sources using DAOStarFinder...")
+                            try:
+                                from photutils.background import Background2D, MedianBackground
+                                from photutils.detection import DAOStarFinder
+
+                                from psfcaptain.image_io import load_image
+
+                                # Load the image data
+                                data, header = load_image(image_path)
+                                ny_img, nx_img = data.shape
+
+                                # Estimate local background (same as in process_image)
+                                bkg_estimator = MedianBackground()
+                                bkg = Background2D(data, (50, 50), filter_size=(3, 3), bkg_estimator=bkg_estimator)
+                                data_sub = data - bkg.background
+                                std_local = np.median(bkg.background_rms)
+
+                                # Run DAOStarFinder with a robust 3.5 sigma threshold to get clean bright stars
+                                dao_f = DAOStarFinder(fwhm=3.0, threshold=3.5 * std_local)
+                                dao_src = dao_f(data_sub)
+
+                                if dao_src is not None and len(dao_src) >= 10:
+                                    # Filter edge stars (within 25 pixels)
+                                    edge_m = (dao_src['xcentroid'] >= 25) & (dao_src['xcentroid'] <= nx_img - 25) & \
+                                             (dao_src['ycentroid'] >= 25) & (dao_src['ycentroid'] <= ny_img - 25)
+                                    dao_src_filt = dao_src[edge_m]
+
+                                    if len(dao_src_filt) >= 10:
+                                        num_dao = min(len(dao_src_filt), 50)
+                                        print(f"Submitting top {num_dao} DAO-extracted sources to Astrometry...")
+                                        s_indices = np.argsort(dao_src_filt['peak'])[::-1]
+                                        x_dao = np.asarray(dao_src_filt['xcentroid'])[s_indices][:num_dao]
+                                        y_dao = np.asarray(dao_src_filt['ycentroid'])[s_indices][:num_dao]
+
+                                        wcs_header = ast.solve_from_source_list(x_dao, y_dao, nx_img, ny_img,
+                                                                               solve_timeout=180,
+                                                                               scale_units='arcsecperpix',
+                                                                               scale_lower=scale_low,
+                                                                               scale_upper=scale_high)
+                            except Exception as e_dao:
+                                print(f"DAO fallback extraction failed: {e_dao}.")
+
+                        if not wcs_header:
+                            print("DAO-optimized solve failed or timed out. Falling back to full image solve on the same server...")
+                            wcs_header = ast.solve_from_image(image_path, solve_timeout=180,
+                                                             scale_units='arcsecperpix',
+                                                             scale_lower=scale_low,
+                                                             scale_upper=scale_high)
+                    else:
+                        if attempt == 0:
+                            print("Submitting full image to Astrometry...")
+                        else:
+                            print(f"Submitting full image to Astrometry (Attempt {attempt+1}/{max_retries})...")
+                        wcs_header = ast.solve_from_image(image_path, solve_timeout=180,
+                                                         scale_units='arcsecperpix',
+                                                         scale_lower=scale_low,
+                                                         scale_upper=scale_high)
+                    break  # Success!
+                except Exception as e:
+                    if "Login failed" in str(e) or "invalid API key" in str(e).lower():
+                        raise e
+                    # Do not retry on timeout errors; raise immediately to try next server
+                    if "timeout" in str(e).lower():
+                        raise e
+                    if attempt < max_retries - 1:
+                        print(f"Astrometry solver encountered error: {e}. Retrying in 5 seconds...")
+                        time.sleep(5)
+                    else:
+                        raise e
+
             if wcs_header:
                 from astropy.wcs import WCS
                 wcs = WCS(wcs_header)
@@ -198,6 +342,8 @@ def solve_astrometry(image_path, sources=None, width=None, height=None, api_key=
                 print(f"Astrometry failed via {server_url}.")
         except Exception as e:
             print(f"Astrometry API solver failed for {server_url}: {e}")
+            import traceback
+            traceback.print_exc()
 
     return None
 

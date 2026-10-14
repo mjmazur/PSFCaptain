@@ -1,5 +1,6 @@
-# Solver cache
+# Solver cache / lock
 .astrometry_cache/
+.astrometry_lock/
 
 # Python
 __pycache__/
