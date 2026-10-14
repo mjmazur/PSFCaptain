@@ -134,7 +134,11 @@ def _sky_relative(meta):
     grid = np.asarray(meta['sky_grid'], dtype=float)
     n = grid.shape[0]
     c0, c1 = int(n * 0.4), int(np.ceil(n * 0.6))
-    return grid / np.median(grid[c0:c1, c0:c1])
+    center = np.median(grid[c0:c1, c0:c1])
+    # A black-clipped or bias-subtracted camera can leave the sky at zero: nothing to normalize.
+    if not np.isfinite(center) or center <= 0:
+        return np.full_like(grid, np.nan)
+    return grid / center
 
 
 def frame_metrics(meta, df, limit_column):
@@ -519,22 +523,33 @@ def build_report(csvs_dir, output_path, image_names=None, title=None):
               'Relative illumination (stars)', '% of center, cell median', '{:.0f}',
               'Needs catalog-matched stars\n(--astrometry --absolute)')
     ax = fig.add_subplot(gs[3, 1])
-    sky = gaussian_filter(np.mean([_sky_relative(m) for m in metas], axis=0) * 100, 1.0, mode='nearest')
+    sky_grids = [g for g in (_sky_relative(m) for m in metas) if np.isfinite(g).all()]
+    has_sky = bool(sky_grids)
+    if has_sky:
+        sky = gaussian_filter(np.mean(sky_grids, axis=0) * 100, 1.0, mode='nearest')
+    else:
+        sky = np.full((len(metas[0]['sky_grid']),) * 2, np.nan)
     _style_axis(ax, 'Relative illumination (sky background)')
     ax.set_xticks([])
     ax.set_yticks([])
-    im = ax.imshow(sky, origin='lower', extent=(0, nx, 0, ny), cmap=SEQUENTIAL, aspect='equal',
-                   interpolation='bilinear')
-    levels = np.arange(np.floor(sky.min() / 5) * 5, sky.max() + 5, 5)
-    if len(levels) > 1:
-        gx = (np.arange(sky.shape[1]) + 0.5) / sky.shape[1] * nx
-        gy = (np.arange(sky.shape[0]) + 0.5) / sky.shape[0] * ny
-        cs = ax.contour(gx, gy, sky, levels=levels, colors='white', linewidths=0.6)
-        ax.clabel(cs, fontsize=5, fmt='%d')
-    cbar = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.06, pad=0.03, aspect=30)
-    cbar.set_label('% of center sky level', fontsize=6, color=INK_2)
-    cbar.ax.tick_params(labelsize=5.5, colors=INK_2, length=2)
-    cbar.outline.set_edgecolor(GRID)
+    if has_sky:
+        im = ax.imshow(sky, origin='lower', extent=(0, nx, 0, ny), cmap=SEQUENTIAL, aspect='equal',
+                       interpolation='bilinear')
+        levels = np.arange(np.floor(sky.min() / 5) * 5, sky.max() + 5, 5)
+        if len(levels) > 1:
+            gx = (np.arange(sky.shape[1]) + 0.5) / sky.shape[1] * nx
+            gy = (np.arange(sky.shape[0]) + 0.5) / sky.shape[0] * ny
+            cs = ax.contour(gx, gy, sky, levels=levels, colors='white', linewidths=0.6)
+            ax.clabel(cs, fontsize=5, fmt='%d')
+        cbar = fig.colorbar(im, ax=ax, orientation='horizontal', fraction=0.06, pad=0.03, aspect=30)
+        cbar.set_label('% of center sky level', fontsize=6, color=INK_2)
+        cbar.ax.tick_params(labelsize=5.5, colors=INK_2, length=2)
+        cbar.outline.set_edgecolor(GRID)
+    else:
+        ax.set_facecolor('#f6f6f4')
+        ax.text(0.5, 0.5, 'Sky background is zero at the center\n(black-clipped or bias-subtracted frames)',
+                ha='center', va='center', fontsize=6.5, color=INK_MUTED, transform=ax.transAxes)
+        ax.set_aspect(ny / nx)
 
     ax = fig.add_subplot(gs[3, 2])
     _style_axis(ax, 'Light falloff vs field radius')
@@ -545,8 +560,9 @@ def build_report(csvs_dir, output_path, image_names=None, title=None):
     gu, gv = np.meshgrid(g, g)
     grho = np.hypot((gu - 0.5) * nx, (gv - 0.5) * ny) / np.hypot(nx / 2, ny / 2)
     c, med, lo, hi = _radial_profile(grho.ravel(), sky.ravel(), 10)
-    ax.fill_between(c, lo, hi, color=SERIES_2, alpha=0.15, lw=0)
-    ax.plot(c, med, color=SERIES_2, lw=2, label='Sky background')
+    if has_sky:
+        ax.fill_between(c, lo, hi, color=SERIES_2, alpha=0.15, lw=0)
+        ax.plot(c, med, color=SERIES_2, lw=2, label='Sky background')
     if not matched.empty:
         ax.scatter(matched['rho'], matched['rel_illum'] * 100, s=3, color=INK_MUTED, alpha=0.35, lw=0)
         c, med, lo, hi = _radial_profile(matched['rho'].values, matched['rel_illum'].values * 100,
@@ -554,7 +570,7 @@ def build_report(csvs_dir, output_path, image_names=None, title=None):
         if len(c):
             ax.plot(c, med, color=SERIES_1, lw=2, marker='o', ms=3, label='Stars (catalog)')
     ax.axhline(100, color=INK_MUTED, lw=0.6, ls='--')
-    shown = [sky.ravel()]
+    shown = [sky.ravel()] if has_sky else [np.array([100.0])]
     if not matched.empty:
         shown.append(np.nanpercentile(matched['rel_illum'] * 100, [5, 95]))
     shown = np.concatenate(shown)
