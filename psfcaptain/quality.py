@@ -16,6 +16,23 @@ from photutils.background import Background2D, MedianBackground
 # Resolution of the normalized sky-background grid stored in the sidecar.
 SKY_GRID_SIZE = 32
 
+# Exposure and camera keywords copied from the FITS header into the sidecar, when present.
+HEADER_KEYWORDS = ('EXPTIME', 'EXPOSURE', 'GAIN', 'EGAIN', 'ISOSPEED', 'XBINNING', 'YBINNING',
+                   'CCD-TEMP', 'SET-TEMP', 'FILTER', 'FRAMERAT', 'PIXFMT', 'INSTRUME', 'TELESCOP',
+                   'FOCALLEN', 'APTDIA', 'SITELAT', 'SITELONG', 'SITEELEV')
+
+
+def _header_values(header):
+    """JSON-safe values of the HEADER_KEYWORDS present in `header`."""
+    if header is None:
+        return {}
+    values = {}
+    for key in HEADER_KEYWORDS:
+        if key in header and header[key] is not None and not isinstance(header[key], bool):
+            value = header[key]
+            values[key] = value.strip() if isinstance(value, str) else value
+    return values
+
 
 def _saturation_level(data, header):
     """Best guess at the saturation level of the raw image."""
@@ -60,6 +77,7 @@ def measure_field_quality(data, header, df, wcs, nx, ny):
         'sky_median': float(np.median(bkg.background)),
         'sky_rms_median': float(np.median(bkg.background_rms)),
         'saturation_level': _saturation_level(data, header),
+        'header': _header_values(header),
     }
 
     # Sky background sampled on a normalized grid (cell centers), for vignetting.

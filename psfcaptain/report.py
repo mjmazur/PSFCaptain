@@ -419,6 +419,73 @@ def _secondary_numbers(metrics):
 # Report
 # ---------------------------------------------------------------------------
 
+def _header_value(metas, *keys):
+    """Distinct values of the first header keyword in `keys` found in any frame."""
+    for key in keys:
+        values = [m.get('header', {}).get(key) for m in metas]
+        values = [v for v in values if v not in (None, '')]
+        if key == 'EXPTIME' and not values:
+            values = [m['exptime'] for m in metas if m.get('exptime') is not None]
+        if values:
+            return sorted(set(values), key=str)
+    return []
+
+
+def _num(value):
+    """Compact number: 0.04, 15, 327 (strings pass through)."""
+    try:
+        return f'{float(value):g}'
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _exposure_lines(metas):
+    """Header lines describing exposure, camera and site, from whichever FITS keywords exist."""
+    def show(values, unit='', fmt=_num):
+        if not values:
+            return None
+        if len(values) == 1:
+            return fmt(values[0]) + unit
+        try:
+            return f'{fmt(min(values, key=float))}–{fmt(max(values, key=float))}{unit}'
+        except (TypeError, ValueError):
+            return 'varies'
+
+    def exposure(v):
+        v = float(v)
+        return f'{v * 1000:g} ms' if v < 1 else f'{v:g} s'
+
+    exposure_parts = [
+        ('Exposure', show(_header_value(metas, 'EXPTIME', 'EXPOSURE'), fmt=exposure)),
+        ('Gain', show(_header_value(metas, 'GAIN', 'EGAIN'))),
+        ('ISO', show(_header_value(metas, 'ISOSPEED'))),
+        ('Frame rate', show(_header_value(metas, 'FRAMERAT'), ' fps')),
+        ('Filter', show(_header_value(metas, 'FILTER'))),
+        ('Sensor temp', show(_header_value(metas, 'CCD-TEMP'), ' °C', fmt=lambda v: f'{float(v):.1f}')),
+    ]
+    xbin, ybin = _header_value(metas, 'XBINNING'), _header_value(metas, 'YBINNING')
+    if xbin or ybin:
+        exposure_parts.append(('Binning', f'{show(xbin) or "?"} × {show(ybin) or "?"}'))
+    exposure_parts.append(('Pixel format', show(_header_value(metas, 'PIXFMT'))))
+
+    camera = _header_value(metas, 'INSTRUME', 'TELESCOP')
+    camera_parts = [('Camera', ', '.join(map(str, camera)) if camera else None),
+                    ('Focal length', show(_header_value(metas, 'FOCALLEN'), ' mm')),
+                    ('Aperture', show(_header_value(metas, 'APTDIA'), ' mm'))]
+    lat, lon = _header_value(metas, 'SITELAT'), _header_value(metas, 'SITELONG')
+    if len(lat) == 1 and len(lon) == 1:
+        elev = _header_value(metas, 'SITEELEV')
+        site = f'{float(lat[0]):.4f}°, {float(lon[0]):.4f}°'
+        camera_parts.append(('Site', site + (f', {_num(elev[0])} m' if len(elev) == 1 else '')))
+
+    lines = []
+    for parts in (exposure_parts, camera_parts):
+        shown = [f'{label}: {value}' for label, value in parts if value]
+        if shown:
+            lines.append('   ·   '.join(shown))
+    return lines
+
+
 def build_report(csvs_dir, output_path, image_names=None, title=None):
     """Builds the single-page PDF report. Returns the output path, or None if nothing to report."""
     frames = load_frames(csvs_dir, image_names)
@@ -465,8 +532,8 @@ def build_report(csvs_dir, output_path, image_names=None, title=None):
     catalog = metas[0].get('catalog') or 'none'
     scales = [m['pixel_scale_center'] for m in metas if m.get('pixel_scale_center')]
     scale = float(np.mean(scales)) if scales else np.nan
-    names = [m['image'] for m in metas]
-    frame_text = names[0] if len(names) == 1 else f'{len(names)} frames ({names[0]} … {names[-1]})'
+    names = [os.path.splitext(m['image'])[0] for m in metas]
+    frame_text = names[0] if len(names) == 1 else f'{len(names)} ({names[0]} … {names[-1]})'
     info = [
         f'Frames: {frame_text}',
         f'Sensor: {nx} × {ny} px' + (f'   ·   Scale: {scale:.2f}"/px   ·   Field: '
@@ -474,6 +541,7 @@ def build_report(csvs_dir, output_path, image_names=None, title=None):
         f'Finder: {finder}   ·   Catalog: {catalog}   ·   Aperture radius: '
         f'{np.nanmean([m.get("aperture_radius") or np.nan for m in metas]):.1f} px   ·   '
         f'Stars used: {len(stars)}',
+        *_exposure_lines(metas),
         (f'Observed: {dates[0][:19]}' + (f' → {dates[-1][:19]}' if len(dates) > 1 else '') + '   ·   ' if dates else '')
         + f'Generated: {datetime.datetime.now():%Y-%m-%d %H:%M}',
     ]
