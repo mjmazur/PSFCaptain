@@ -20,7 +20,11 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
   - **Gaia G-band**: Best for medium to faint stars.
   - **Tycho-2 VT-band**: Optimized for bright stars (magnitude 0-9).
   - **Robust Fitting**: Uses RANSAC algorithm to automatically exclude outliers for high-precision zero-point calibration.
-  - **Smart Tiling**: Automatically handles large fields-of-view (up to 10+ degrees) by dividing queries into manageable tiles.
+  - **Smart Tiling**: Automatically handles large fields-of-view (up to 10+ degrees) by dividing queries into manageable tiles (online queries only; skipped entirely once a local catalog is available, see below).
+  - **Local Catalog Caching**: Gaia and Tycho-2 both prefer a local, in-memory catalog over per-field network queries:
+    - **Gaia**: Loaded from an [RMS](https://github.com/CroatianMeteorNetwork/RMS) installation's pre-filtered catalog file (`gaia_dr2_mag_11.5.npy`), if one is found on the system.
+    - **Tycho-2**: The full ~2.5 million star catalog is downloaded from VizieR once and cached under `.catalog_cache/` in the working directory; every run after that reads the local cache instead of querying online.
+    - Either way, once a local catalog is in play, a field is matched with a single in-memory box+circle filter instead of a network round trip per tile.
 - **Morphology Analysis**: Measures Point Spread Function (PSF) characteristics:
   - FWHM (Full Width at Half Maximum) in pixels and arcseconds.
   - Elongation and Orientation Angle (Theta).
@@ -158,7 +162,7 @@ Saved in the `Figures/Individuals/` rendering directory:
 ### Calibration & Analysis
 - `--astrometry`: Solve for RA/Dec via Astrometry.net.
 - `--absolute`: Perform absolute photometry calibration.
-- `--catalog`: Choose `gaia` or `tycho2`.
+- `--catalog`: Choose `gaia` or `tycho2`. For Gaia, append a magnitude limit as `gaia:12.0` (or pass it as a trailing space-separated number); default limit is 12.0. Both catalogs prefer a local source over the network when available (see Local Catalog Caching above).
 - `--api-key`: Astrometry.net API key.
 
 ### Fine-Tuning Detection
