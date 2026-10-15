@@ -8,6 +8,7 @@ from psfcaptain.detection import detect_stars, subtract_background
 from psfcaptain.image_io import load_image
 from psfcaptain.morphology import compute_fwhm_arcsec, measure_morphology
 from psfcaptain.photometry import calibrate_absolute, reject_fwhm_outliers, reject_psf_limit, to_dataframe
+from psfcaptain.quality import measure_field_quality, write_quality_meta
 
 
 def process_image(image_path, args, figures_dir, csvs_dir):
@@ -38,6 +39,17 @@ def process_image(image_path, args, figures_dir, csvs_dir):
     df = compute_fwhm_arcsec(df, wcs)
 
     zero_point = calibrate_absolute(df, wcs, nx, ny, args)
+
+    df, quality_meta = measure_field_quality(data, header, df, wcs, nx, ny)
+    quality_meta.update({
+        'image': name,
+        'finder': ' '.join(args.finder) if isinstance(args.finder, list) else args.finder,
+        'catalog': args.catalog if args.absolute else None,
+        'zero_point': float(zero_point) if zero_point is not None else None,
+        'n_detected': int(len(df) + len(df_outliers)),
+        'n_valid': int(len(df)),
+    })
+    write_quality_meta(quality_meta, csvs_dir, name)
 
     results_csv = os.path.join(csvs_dir, f'{name}_results.csv')
     df.to_csv(results_csv, index=False)
