@@ -1,2 +1,21 @@
-# Ignore
-.astrometry_cache
+# Solver cache / lock
+.astrometry_cache/
+.astrometry_lock/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Generated outputs: the pipeline writes Figures/ and CSVs/ next to its input
+# images unless --output-dir is given. Curated runs live in results/ and are tracked.
+/Figures/
+/Figures_*/
+/CSVs/
+data/**/Figures/
+data/**/Figures_*/
+data/**/CSVs/
