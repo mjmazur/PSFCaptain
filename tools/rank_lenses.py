@@ -123,7 +123,7 @@ def style_sheet(ws, header_fill='1F3864'):
     for row in ws.iter_rows(min_row=2):
         for c in row:
             if isinstance(c.value, float):
-                c.number_format = '0.000'
+                c.number_format = '0' if c.value.is_integer() else '0.000'
 
 
 def write_workbook(path, ranking, metrics, method, root):
@@ -135,8 +135,8 @@ def write_workbook(path, ranking, metrics, method, root):
             style_sheet(xw.sheets[name])
         ws = xw.sheets['Ranking']
         for row in range(2, ws.max_row + 1):
-            ws.cell(row, 2).font = Font(bold=True)
-            ws.cell(row, 2).number_format = '0.0'
+            ws.cell(row, 3).font = Font(bold=True)
+            ws.cell(row, 3).number_format = '0.0'
             if row == 2:
                 for c in ws[row][:3]:
                     c.fill = PatternFill('solid', fgColor='C6E0B4')
