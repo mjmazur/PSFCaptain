@@ -10,7 +10,7 @@ from functools import partial
 import numpy as np
 import pandas as pd
 
-from psfcaptain import plots
+from psfcaptain import plots, report
 from psfcaptain.pipeline import process_image
 
 
@@ -72,6 +72,10 @@ def build_parser():
     parser.add_argument("--scale-high", type=float, default=50.0, help="Upper limit of pixel scale in arcsec/pixel (default 50.0).")
     parser.add_argument("--output-dir", default=None,
                         help="Directory to write Figures/ and CSVs/ into (defaults to the input image's directory).")
+    parser.add_argument("--report", default=None,
+                        help="Path of the single-page lens quality PDF (default: lens_quality_report.pdf in the output directory).")
+    parser.add_argument("--report-title", default=None, help="Title printed on the report (e.g. the lens name).")
+    parser.add_argument("--no-report", action="store_true", help="Skip the lens quality PDF report.")
     return parser
 
 
@@ -208,6 +212,12 @@ def main():
 
     if args.absolute:
         plots.plot_composite(image_list, csvs_dir, figures_dir)
+
+    if not args.no_report:
+        report_path = args.report or os.path.join(output_base, 'lens_quality_report.pdf')
+        report.build_report(csvs_dir, report_path,
+                            image_names=[os.path.basename(img) for img in image_list],
+                            title=args.report_title)
 
 
 if __name__ == "__main__":

@@ -20,13 +20,18 @@ PSFCaptain is a Python-based utility designed for automated star detection, phot
   - **Gaia G-band**: Best for medium to faint stars.
   - **Tycho-2 VT-band**: Optimized for bright stars (magnitude 0-9).
   - **Robust Fitting**: Uses RANSAC algorithm to automatically exclude outliers for high-precision zero-point calibration.
-  - **Smart Tiling**: Automatically handles large fields-of-view (up to 10+ degrees) by dividing queries into manageable tiles.
+  - **Smart Tiling**: Automatically handles large fields-of-view (up to 10+ degrees) by dividing queries into manageable tiles (online queries only; skipped entirely once a local catalog is available, see below).
+  - **Local Catalog Caching**: Gaia and Tycho-2 both prefer a local, in-memory catalog over per-field network queries:
+    - **Gaia**: Loaded from an [RMS](https://github.com/CroatianMeteorNetwork/RMS) installation's pre-filtered catalog file (`gaia_dr2_mag_11.5.npy`), if one is found on the system.
+    - **Tycho-2**: The full ~2.5 million star catalog is downloaded from VizieR once and cached under `.catalog_cache/` in the working directory; every run after that reads the local cache instead of querying online.
+    - Either way, once a local catalog is in play, a field is matched with a single in-memory box+circle filter instead of a network round trip per tile.
 - **Morphology Analysis**: Measures Point Spread Function (PSF) characteristics:
   - FWHM (Full Width at Half Maximum) in pixels and arcseconds.
   - Elongation and Orientation Angle (Theta).
 - **Automatic Image Inversion**: Intelligent detection and inversion of light-background images.
 - **Astrometric Integration**: Seamless integration with `astrometry.net` for RA/Dec solving.
 - **Comprehensive Visualization**: Generates heatmaps, histograms, and star-field summary overlays.
+- **Lens Quality Report**: A single-page PDF summarizing optical quality across the whole field of view (PSF size and shape, 5σ limiting magnitude, vignetting, plate-scale distortion), averaged over all frames in a run. See [Lens Quality Report](#lens-quality-report).
 
 ## Project Layout
 
@@ -42,6 +47,8 @@ psfcaptain/          Core package
   catalogs.py        Gaia / Tycho-2 queries with tiling for large fields
   photometry.py      Instrumental magnitudes, outlier rejection, zero-point fit
   plots.py           All figure generation
+  quality.py         Per-image aperture S/N and sky-background map for the report
+  report.py          Single-page lens quality PDF (also runnable on an existing CSVs/ dir)
   wcs_utils.py       Shared WCS helpers
 tools/               Standalone FITS utilities (binning, stacking, header edits)
 tests/               Tests
@@ -123,6 +130,41 @@ python tools/check_fits.py input.fits                         # Shape/dtype of e
 python tools/inspect_wcs.py                                   # Pixel scales in the solver cache
 ```
 
+## Lens Quality Report
+
+Every run ends by writing `lens_quality_report.pdf` to the output directory, together with
+`lens_quality_report_metrics.csv` (one row of numbers per frame). With several frames, the
+table shows the **mean ± standard deviation across frames**; the maps and radial profiles
+pool the stars of all frames in normalized sensor coordinates.
+
+```bash
+# Best results: astrometry + catalog calibration, several frames of the same lens
+python -m psfcaptain frames/ --astrometry --absolute --catalog gaia --report-title "Lens 25mm f/1.4"
+
+# Rebuild just the report from an existing CSVs/ directory
+python -m psfcaptain.report frames/CSVs -o lens_25mm.pdf --title "Lens 25mm f/1.4"
+```
+
+What the page contains:
+
+| Quantity | How it is measured |
+|---|---|
+| **PSF size** | FWHM per star (px and arcsec), as a binned field map and versus field radius |
+| **PSF shape** | Elongation (a/b) and ellipticity whiskers (e = 1 − b/a, along the major axis), which show coma, astigmatism and tilt patterns |
+| **Limiting magnitude** | 5σ point-source limit, `m + 2.5 log10(S/N / 5)`, from fixed-aperture photometry (r = median FWHM) with a background-limited S/N. With ≥ 30 catalog matches it is anchored to catalog magnitudes and includes vignetting; otherwise it uses the zero point (or stays instrumental) |
+| **Vignetting** | Relative illumination from catalog-matched stars (aperture counts per unit catalog flux, normalized to the center) and from the smooth sky background |
+| **Tilt** | Spread of the four corner FWHMs relative to the center FWHM |
+| **Distortion** | Plate-scale change from center to corners (needs `--astrometry`) |
+
+Field zones: *center* < 1/3, *middle* 1/3–2/3 and *edge* > 2/3 of the center-to-corner
+distance; *corners* are the corner cells of a 3 × 3 grid.
+
+Tips: the sky-based vignetting curve also picks up sky gradients and any camera bias offset,
+so evenly lit frames (twilight flats) give the cleanest curve. The star-based curve and the
+catalog-anchored limiting magnitude need many matched stars; Gaia gives far more than Tycho-2.
+
+Report options: `--report PATH`, `--report-title TEXT`, `--no-report`.
+
 ## Output
 
 ### 1. CSV Results
@@ -132,7 +174,10 @@ A file named `[image_name]_results.csv` containing:
 - `mag_instr`: Instrumental magnitude.
 - `mag_abs`: Calibrated absolute magnitude (if `--absolute` is used).
 - `fwhm`, `fwhm_arcsec`: PSF size.
-- `elongation`, `theta`: Star shape characteristics.
+- `elongation`, `theta`: Star shape characteristics (`theta` is the major-axis angle in degrees counter-clockwise from +x).
+- `ap_flux`, `mag_ap`, `snr`, `sky`, `sky_rms`, `saturated`: Fixed-aperture photometry used by the lens quality report.
+
+A `[image_name]_quality.json` sidecar stores per-image sky statistics, the sky-background grid and plate scales.
 
 ### 2. Figures
 Saved in the `Figures/` output directory:
@@ -158,7 +203,7 @@ Saved in the `Figures/Individuals/` rendering directory:
 ### Calibration & Analysis
 - `--astrometry`: Solve for RA/Dec via Astrometry.net.
 - `--absolute`: Perform absolute photometry calibration.
-- `--catalog`: Choose `gaia` or `tycho2`.
+- `--catalog`: Choose `gaia` or `tycho2`. For Gaia, append a magnitude limit as `gaia:12.0` (or pass it as a trailing space-separated number); default limit is 12.0. Both catalogs prefer a local source over the network when available (see Local Catalog Caching above).
 - `--api-key`: Astrometry.net API key.
 
 ### Fine-Tuning Detection

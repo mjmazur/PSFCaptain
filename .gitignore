@@ -2,6 +2,9 @@
 .astrometry_cache/
 .astrometry_lock/
 
+# Cached full catalog downloads (e.g. Tycho-2)
+.catalog_cache/
+
 # Python
 __pycache__/
 *.py[cod]

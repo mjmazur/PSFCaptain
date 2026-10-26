@@ -8,6 +8,12 @@ from astropy.coordinates import SkyCoord
 from psfcaptain.catalogs import query_catalog_tiled
 from psfcaptain.wcs_utils import safe_pixel_to_world
 
+# Catalog cross-match: search radius, and how far the catalog magnitude may sit from the
+# zero-point prediction (fainter / brighter) before the pair is rejected as a false match.
+MATCH_RADIUS_PX = 2.0
+MATCH_FAINT_TOL = 0.75
+MATCH_BRIGHT_TOL = 2.5
+
 
 def to_dataframe(sources):
     """Converts a source table to a DataFrame with instrumental magnitudes, clipping non-positive flux."""
@@ -70,6 +76,38 @@ def reject_psf_limit(df, df_outliers, psf_limit):
     return df, df_outliers
 
 
+def _fit_zero_point(mag_instr, cat_mag, mag_label, verbose=True):
+    """Zero point (catalog - instrumental) from matched stars, RANSAC-robust when enough are available."""
+    log = print if verbose else (lambda *a, **k: None)
+    # Selective RANSAC Fitting: Use stars with mag_instr < 0
+    fit_mask = mag_instr < 0
+    if fit_mask.sum() > 5:
+        log(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < 0...")
+        x_fit = mag_instr[fit_mask].reshape(-1, 1)
+        y_fit = cat_mag[fit_mask]
+    else:
+        if fit_mask.sum() > 0:
+            log(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < 0. Using all {len(mag_instr)} matched stars for fit.")
+        x_fit = mag_instr.reshape(-1, 1)
+        y_fit = cat_mag
+
+    if len(x_fit) >= 3:
+        from sklearn.linear_model import RANSACRegressor
+        ransac = RANSACRegressor()
+        ransac.fit(x_fit, y_fit)
+        inlier_mask = ransac.inlier_mask_
+
+        # RANSAC fits y = slope*x + intercept with y = cat_mag, x = mag_instr. We expect a slope
+        # near 1 and want cat_mag = mag_instr + ZP, so ZP is the median offset of the inliers.
+        zero_point = np.median(y_fit[inlier_mask] - x_fit[inlier_mask].flatten())
+        log(f"RANSAC Zero-Point ({mag_label}): {zero_point:.3f} mag (based on {inlier_mask.sum()} inliers)")
+    else:
+        log(f"Warning: Only {len(x_fit)} matched stars available. Skipping RANSAC and using strict median offset.")
+        zero_point = np.median(y_fit - x_fit.flatten())
+        log(f"Median Zero-Point ({mag_label}): {zero_point:.3f} mag")
+    return zero_point
+
+
 def calibrate_absolute(df, wcs, nx, ny, args):
     """Matches stars to a reference catalog and derives the photometric zero point."""
     # Absolute Photometry
@@ -110,57 +148,46 @@ def calibrate_absolute(df, wcs, nx, ny, args):
                     catalog_coords = SkyCoord(ra=cat_ra, dec=cat_dec, unit=u.deg)
                     star_coords = safe_pixel_to_world(wcs, df['xcentroid'], df['ycentroid'])
 
-                    # Match
-                    # We use a 5 pixel match limit. Calculate that in arcsec based on image scale
+                    # Candidate pairs within MATCH_RADIUS_PX. The catalog is much denser than
+                    # our detections, so the nearest catalog star is often an unrelated faint one.
                     scale_guess = wcs.pixel_to_world(0,0).separation(wcs.pixel_to_world(1,0)).arcsec
-                    match_limit_arcsec = 5 * scale_guess
-                    print(f"Matching stars with a limit of 5 pixels ({match_limit_arcsec:.2f} arcsec)...")
+                    match_limit_arcsec = MATCH_RADIUS_PX * scale_guess
+                    print(f"Matching stars with a limit of {MATCH_RADIUS_PX:g} pixels ({match_limit_arcsec:.2f} arcsec)...")
 
-                    idx, d2d, _ = star_coords.match_to_catalog_sky(catalog_coords)
-                    matches_mask = d2d < match_limit_arcsec * u.arcsec
+                    cat_mag = np.asarray(cat_mag, dtype=float)
+                    idx_cat, idx_star, d2d, _ = star_coords.search_around_sky(
+                        catalog_coords, match_limit_arcsec * u.arcsec)
 
                     df['catalog_mag'] = np.nan
 
-                    if matches_mask.any():
-                        matched_df = df[matches_mask].copy()
-                        matched_cat_mag = cat_mag[idx[matches_mask]]
-                        df.loc[matches_mask, 'catalog_mag'] = np.asarray(matched_cat_mag)
+                    if len(idx_star) > 0:
+                        # Pass 1: nearest candidate per star, only to get a preliminary zero point.
+                        order = np.argsort(d2d.arcsec)
+                        first = pd.DataFrame({'star': idx_star[order], 'cat': idx_cat[order]}).drop_duplicates('star')
+                        zero_point = _fit_zero_point(df['mag_instr'].values[first['star']],
+                                                     cat_mag[first['cat']], mag_label, verbose=False)
 
-                        # Selective RANSAC Fitting: Use stars with mag_instr < 0
-                        fit_mask = matched_df['mag_instr'] < 0
+                        # Pass 2: per star, the candidate closest in magnitude to the prediction.
+                        # Vignetting only dims a star, so a catalog star much fainter than the
+                        # measurement is a false match; a brighter one may be a vignetted true match.
+                        dm = cat_mag[idx_cat] - (df['mag_instr'].values[idx_star] + zero_point)
+                        ok = (dm < MATCH_FAINT_TOL) & (dm > -MATCH_BRIGHT_TOL)
+                        pairs = pd.DataFrame({'star': idx_star[ok], 'cat': idx_cat[ok], 'adm': np.abs(dm[ok])})
+                        pairs = pairs.sort_values('adm').drop_duplicates('star').drop_duplicates('cat')
+                        print(f"Kept {len(pairs)} magnitude-consistent matches "
+                              f"(of {len(first)} stars with a catalog star within {MATCH_RADIUS_PX:g} px).")
 
-                        if fit_mask.sum() > 5:
-                            print(f"Applying RANSAC fit specifically to {fit_mask.sum()} stars with mag_instr < 0...")
-                            x_fit = matched_df[fit_mask]['mag_instr'].values.reshape(-1, 1)
-                            y_fit = np.asarray(matched_cat_mag[fit_mask])
-                        else:
-                            if fit_mask.sum() > 0:
-                                print(f"Warning: Only {fit_mask.sum()} stars found with mag_instr < 0. Using all {len(matched_df)} matched stars for fit.")
-                            x_fit = matched_df['mag_instr'].values.reshape(-1, 1)
-                            y_fit = np.asarray(matched_cat_mag)
-
-                        if len(x_fit) >= 3:
-                            from sklearn.linear_model import RANSACRegressor
-                            ransac = RANSACRegressor()
-                            ransac.fit(x_fit, y_fit)
-                            inlier_mask = ransac.inlier_mask_
-
-                            # The offset (zero point) is the intercept if we assume slope=1
-                            # Actually, we want phot_cat = mag_instr + ZP, so ZP = phot_cat - mag_instr
-                            # RANSAC fits y = slope*x + intercept. Here y is cat_mag, x is mag_instr.
-                            # We expect slope close to 1.
-                            zero_point = np.median(y_fit[inlier_mask] - x_fit[inlier_mask].flatten())
-                            print(f"RANSAC Zero-Point ({mag_label}): {zero_point:.3f} mag (based on {inlier_mask.sum()} inliers)")
-                        else:
-                            print(f"Warning: Only {len(x_fit)} matched stars available. Skipping RANSAC and using strict median offset.")
-                            zero_point = np.median(y_fit - x_fit.flatten())
-                            print(f"Median Zero-Point ({mag_label}): {zero_point:.3f} mag")
-
+                    if len(idx_star) > 0 and len(pairs) > 0:
+                        star_rows = df.index[pairs['star'].values]
+                        df.loc[star_rows, 'catalog_mag'] = cat_mag[pairs['cat'].values]
+                        zero_point = _fit_zero_point(df.loc[star_rows, 'mag_instr'].values,
+                                                     cat_mag[pairs['cat'].values], mag_label)
                         df['mag_abs'] = df['mag_instr'] + zero_point
 
                         # We will generate the mag_comparison plot later from the saved CSV
                     else:
-                        print(f"No Gaia stars matched within {match_limit_arcsec:.2f} arcseconds.")
+                        zero_point = None
+                        print(f"No {mag_label} stars matched within {match_limit_arcsec:.2f} arcseconds.")
                 else:
                     print(f"No {args.catalog.upper()} catalog stars remain after magnitude filtering.")
             else:
